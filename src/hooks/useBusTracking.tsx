@@ -1,11 +1,13 @@
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { fetchEtas } from "hk-bus-eta";
+import type { Eta } from "hk-bus-eta";
 import AppContext from "../context/AppContext";
 import DbContext from "../context/DbContext";
 import useLanguage from "./useTranslation";
 import {
   ESTIMATE_PASS_GRACE_MS,
   PASS_GRACE_MS,
+  TRACKING_PROGRESS_KEY,
   alignEtas,
   buildEtaPoints,
   estimateProgressSeq,
@@ -16,7 +18,12 @@ import {
   nextArrivalMs,
   pickReferenceSegment,
 } from "../busTracking";
-import type { EtaPoint, TrackedStop, TrackedTrip } from "../busTracking";
+import type {
+  EtaPoint,
+  TrackedStop,
+  TrackedTrip,
+  TrackingProgress,
+} from "../busTracking";
 
 const BASE_WINDOW = 3;
 const MAX_WINDOW = 8;
@@ -35,6 +42,8 @@ export interface BusTrackingResult {
   isRefreshing: boolean;
   lastUpdatedAt: number | null;
   isComplete: boolean;
+  /** feed an ETA list that a stop view already fetched into the tracker */
+  reportEtas: (routeKey: string, seq: number, etas: Eta[]) => void;
 }
 
 /**
@@ -57,9 +66,12 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
   const [profileLimit, setProfileLimit] = useState(BASE_PROFILE_LIMIT);
 
   const listsRef = useRef(new Map<number, { points: EtaPoint[]; ts: number }>());
+  const listSignaturesRef = useRef(new Map<number, string>());
   const arrivalsRef = useRef(new Map<number, TrackedStop>());
   const observationsRef = useRef(new Map<number, TrackedStop>());
   const profileRef = useRef<number[] | null>(null);
+  const progressWrittenAtRef = useRef(0);
+  const progressTerminusRef = useRef<number | null>(null);
   const windowSizeRef = useRef(BASE_WINDOW);
   const cycleRef = useRef(0);
   const busyRef = useRef(false);
@@ -79,11 +91,21 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
 
   useEffect(() => {
     listsRef.current = new Map();
+    listSignaturesRef.current = new Map();
     arrivalsRef.current = new Map();
     observationsRef.current = new Map();
     profileRef.current = null;
+    progressWrittenAtRef.current = 0;
+    progressTerminusRef.current = null;
     windowSizeRef.current = BASE_WINDOW;
     cycleRef.current = 0;
+    if (!tripKey) {
+      try {
+        localStorage.removeItem(TRACKING_PROGRESS_KEY);
+      } catch {
+        // ignore unavailable storage
+      }
+    }
     setProfileLimit(BASE_PROFILE_LIMIT);
     setStops({});
     setNextSeq(null);
@@ -241,6 +263,45 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
 
     const lastStop = arrivals.get(lastSeq);
     const complete = !!lastStop && lastStop.passed;
+
+    // remember the best-known terminus arrival so a later app launch can
+    // detect a trip that finished while the app was closed
+    let terminusEtaMs = lastStop?.etaMs ?? null;
+    if (terminusEtaMs == null) {
+      // the profile may not reach the terminus yet; project the rest of the
+      // route with the average segment time observed so far
+      const arrivalList = Array.from(arrivals.values());
+      const lastArrival = arrivalList[arrivalList.length - 1];
+      if (lastArrival && lastArrival.seq > boardSeq) {
+        const averageSegmentMs =
+          (lastArrival.etaMs - anchorMs) / (lastArrival.seq - boardSeq);
+        if (Number.isFinite(averageSegmentMs) && averageSegmentMs > 0) {
+          terminusEtaMs =
+            lastArrival.etaMs +
+            Math.max(0, lastSeq - lastArrival.seq) * averageSegmentMs;
+        }
+      }
+    }
+
+    if (terminusEtaMs != null) {
+      const changed =
+        progressTerminusRef.current == null ||
+        Math.abs(terminusEtaMs - progressTerminusRef.current) > 60_000;
+      const stale = now - progressWrittenAtRef.current > 60_000;
+      if (changed || stale) {
+        progressWrittenAtRef.current = now;
+        progressTerminusRef.current = terminusEtaMs;
+        try {
+          const progress: TrackingProgress = {
+            startedAt: trip.startedAt,
+            terminusEtaMs,
+          };
+          localStorage.setItem(TRACKING_PROGRESS_KEY, JSON.stringify(progress));
+        } catch {
+          // ignore unavailable storage
+        }
+      }
+    }
 
     observationsRef.current = observations;
     arrivalsRef.current = arrivals;
@@ -430,6 +491,23 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     recompute,
   ]);
 
+  const reportEtas = useCallback(
+    (routeKey: string, seq: number, etas: Eta[]) => {
+      if (!trip || trip.routeKey !== routeKey || etas.length === 0) return;
+      const signature = etas.map((eta) => eta.eta).join("|");
+      if (listSignaturesRef.current.get(seq) === signature) return;
+      listSignaturesRef.current.set(seq, signature);
+      listsRef.current.set(seq, {
+        points: buildEtaPoints(etas, trip.co, trip.dest, Date.now()),
+        ts: Date.now(),
+      });
+      // an already-fetched stop view is as good as our own fetch, so use it
+      // immediately instead of waiting for the next polling cycle
+      recompute();
+    },
+    [trip, recompute]
+  );
+
   useEffect(() => {
     if (!trip) return;
     if (navigator.userAgent === "prerendering") return;
@@ -450,5 +528,12 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     };
   }, [trip, refreshInterval, refresh]);
 
-  return { stops, nextSeq, isRefreshing, lastUpdatedAt, isComplete };
+  return {
+    stops,
+    nextSeq,
+    isRefreshing,
+    lastUpdatedAt,
+    isComplete,
+    reportEtas,
+  };
 };

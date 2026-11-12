@@ -5,6 +5,18 @@ export type LocalizedText = { zh: string; en: string };
 export type TrackedEtaSource = "realtime" | "scheduled";
 export type TrackedStopSource = TrackedEtaSource | "estimate";
 
+/** storage key of the persisted active trip */
+export const TRACKING_STORAGE_KEY = "busTracking";
+/** storage key of the last known terminus arrival, used to auto-untrack later */
+export const TRACKING_PROGRESS_KEY = "busTrackingProgress";
+/** how long after the terminus arrival a trip is considered over */
+export const TRACKING_COMPLETE_GRACE_MS = 5 * 60_000;
+
+export interface TrackingProgress {
+  startedAt: number;
+  terminusEtaMs: number | null;
+}
+
 export interface TrackedTrip {
   v: 1;
   routeKey: string;
@@ -52,6 +64,8 @@ export const TRACKABLE_COMPANIES: Company[] = [
 
 /** two eta rows within this window are treated as the same bus */
 export const SAME_TRIP_TOLERANCE_MS = 90_000;
+/** estimates can drift further, so allow a wider window when matching rows */
+export const ESTIMATE_MATCH_TOLERANCE_MS = 3 * 60_000;
 /** an observed arrival leaving this long ago is treated as passed */
 export const PASS_GRACE_MS = 2 * 60_000;
 /** an estimated arrival must be this stale before it is treated as passed */
@@ -289,6 +303,17 @@ export const canTrackRoute = (
   if (!stopIds || stopIds.length < 2) return false;
   const firstCo = Object.keys(route.stops)[0] as Company | undefined;
   return !!firstCo && TRACKABLE_COMPANIES.includes(firstCo);
+};
+
+/** the last stop has nowhere further to track to */
+export const canTrackStop = (
+  route: RouteListEntry | undefined,
+  co: Company,
+  seq: number
+): boolean => {
+  if (!route || !canTrackRoute(route, co)) return false;
+  const stopIds = Object.values(route.stops)[0] ?? [];
+  return seq >= 0 && seq < stopIds.length - 1;
 };
 
 export interface LoadJourneyProfileOptions {

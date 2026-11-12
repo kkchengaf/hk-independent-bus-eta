@@ -40,15 +40,17 @@ const TimeReport = ({
   const {
     db: { routeList, stopList },
   } = useContext(DbContext);
-  const { getTrackedStop, isTrackedEta } = useContext(BusTrackingContext);
+  const { getTrackedStop, findTrackedEtaIndex } =
+    useContext(BusTrackingContext);
   const etas = useEtas(`${routeId}/${seq}`);
 
   const trackedStop = getTrackedStop(routeId, seq);
-  const hasTrackedRow = useMemo(
-    () => (etas ?? []).some((eta) => isTrackedEta(routeId, seq, eta)),
-    [etas, isTrackedEta, routeId, seq]
+  const trackedIndex = useMemo(
+    () => (etas ? findTrackedEtaIndex(routeId, seq, etas) : -1),
+    [etas, findTrackedEtaIndex, routeId, seq]
   );
-  const showTrackedEstimate = !!trackedStop && !trackedStop.passed && !hasTrackedRow;
+  const showTrackedEstimate =
+    !!trackedStop && !trackedStop.passed && trackedIndex < 0;
 
   const { route, co, stops } = routeList[routeId];
   const stopId = Object.values(stops)[0][seq];
@@ -119,6 +121,7 @@ const TimeReport = ({
             route={route}
             routeKey={routeId}
             seq={seq}
+            tracked={idx === trackedIndex}
           />
         ))}
       {showTrackedEstimate && trackedStop && (
@@ -188,6 +191,7 @@ interface EtaMsgProps {
   route: string;
   routeKey: string;
   seq: number;
+  tracked: boolean;
 }
 
 const EtaLine = ({
@@ -197,6 +201,7 @@ const EtaLine = ({
   route,
   routeKey,
   seq,
+  tracked,
 }: EtaMsgProps) => {
   const { eta: etaTime, remark, co, dest } = eta;
   const { t } = useTranslation();
@@ -292,7 +297,12 @@ const EtaLine = ({
           {branchRoute && dest[language]}
         </Box>
       </Typography>
-      <TrackedEtaControl routeKey={routeKey} seq={seq} eta={eta} />
+      <TrackedEtaControl
+        routeKey={routeKey}
+        seq={seq}
+        eta={eta}
+        tracked={tracked}
+      />
     </Box>
   );
 };

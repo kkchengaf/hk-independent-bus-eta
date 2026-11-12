@@ -236,6 +236,12 @@ const resources = {
       開啟班次追蹤: "Open bus tracking",
       查看路線: "View route",
       關閉視窗: "Close",
+      實驗性質: "Experimental",
+      "班次到達時間由實時及推算資料組成，僅供參考":
+        "Arrival times combine live and estimated data; for reference only",
+      "此站為終點站，不支援班次追蹤":
+        "This is the final stop; bus tracking is not available",
+      未能取得此班次資料: "No data is available for this trip",
     },
   },
   zh: {

@@ -1,4 +1,4 @@
-import { useContext, useEffect, useMemo, useRef } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Button,
@@ -10,7 +10,7 @@ import {
   DialogTitle,
   IconButton,
   List,
-  ListItem,
+  ListItemButton,
   ListItemText,
   Typography,
 } from "@mui/material";
@@ -55,7 +55,8 @@ const TrackingDialog = () => {
     closeDialog,
     stopTracking,
   } = useContext(BusTrackingContext);
-  const rowRefs = useRef<Record<number, HTMLLIElement | null>>({});
+  const rowRefs = useRef<Record<number, HTMLElement | null>>({});
+  const [emptyTimedOut, setEmptyTimedOut] = useState(false);
 
   const rows = useMemo(
     () => Object.values(stops).sort((a, b) => a.seq - b.seq),
@@ -70,13 +71,36 @@ const TrackingDialog = () => {
     });
   }, [isDialogOpen, nextSeq]);
 
+  useEffect(() => {
+    if (!isDialogOpen || rows.length > 0) {
+      setEmptyTimedOut(false);
+      return;
+    }
+    const timer = setTimeout(() => setEmptyTimedOut(true), 6000);
+    return () => clearTimeout(timer);
+  }, [isDialogOpen, rows.length, trip?.startedAt]);
+
   if (!trip) return null;
 
   const route = routeList[trip.routeKey];
   const stopIds = route ? Object.values(route.stops)[0] ?? [] : [];
   const boardStop = stopList[stopIds[trip.boardSeq]];
+  const isFinalStopOnly = trip.boardSeq >= stopIds.length - 1;
+
+  const openStop = (seq: number) => {
+    const stopId = stopIds[seq];
+    if (!stopId) return;
+    closeDialog();
+    navigate(`/${language}/route/${trip.routeKey.toLowerCase()}/${stopId}%2C${seq}`);
+  };
 
   const handleViewRoute = () => {
+    // jump to the stop the bus is heading to, not the route's first stop
+    const targetSeq = nextSeq ?? trip.boardSeq;
+    if (stopIds[targetSeq]) {
+      openStop(targetSeq);
+      return;
+    }
     closeDialog();
     navigate(`/${language}/route/${trip.routeKey.toLowerCase()}`);
   };
@@ -132,9 +156,23 @@ const TrackingDialog = () => {
             {t("此班次為預定班次，時間或有偏差")}
           </Typography>
         )}
+        <Box sx={experimentalSx}>
+          <Chip size="small" variant="outlined" label={t("實驗性質")} />
+          <Typography variant="caption" color="text.secondary">
+            {t("班次到達時間由實時及推算資料組成，僅供參考")}
+          </Typography>
+        </Box>
         {rows.length === 0 ? (
           <Box sx={loadingSx}>
-            <CircularProgress size={24} />
+            {isFinalStopOnly || emptyTimedOut ? (
+              <Typography variant="body2" color="text.secondary" align="center">
+                {isFinalStopOnly
+                  ? t("此站為終點站，不支援班次追蹤")
+                  : t("未能取得此班次資料")}
+              </Typography>
+            ) : (
+              <CircularProgress size={24} />
+            )}
           </Box>
         ) : (
           <List dense disablePadding>
@@ -162,31 +200,18 @@ const TrackingDialog = () => {
                 : t("實時");
 
               return (
-                <ListItem
+                <ListItemButton
                   key={stop.seq}
-                  ref={(el: HTMLLIElement | null) => {
+                  ref={(el: HTMLElement | null) => {
                     rowRefs.current[stop.seq] = el;
                   }}
+                  onClick={() => openStop(stop.seq)}
                   sx={
                     stop.passed
                       ? passedItemSx
                       : isNext
                       ? nextItemSx
                       : undefined
-                  }
-                  secondaryAction={
-                    <Chip
-                      size="small"
-                      variant="outlined"
-                      color={
-                        stop.passed
-                          ? "default"
-                          : stop.source === "estimate"
-                          ? "warning"
-                          : "success"
-                      }
-                      label={sourceLabel}
-                    />
                   }
                 >
                   <ListItemText
@@ -200,7 +225,7 @@ const TrackingDialog = () => {
                           stopList[stopIds[stop.seq]]?.name[language] ??
                           stopIds[stop.seq] ??
                           ""
-                        }`}
+                        } `}
                       </Typography>
                     }
                     secondary={
@@ -214,7 +239,21 @@ const TrackingDialog = () => {
                     }
                     secondaryTypographyProps={{ component: "span" }}
                   />
-                </ListItem>
+                  <Chip
+                    component="span"
+                    size="small"
+                    variant="outlined"
+                    color={
+                      stop.passed
+                        ? "default"
+                        : stop.source === "estimate"
+                        ? "warning"
+                        : "success"
+                    }
+                    label={sourceLabel}
+                    sx={sourceChipSx}
+                  />
+                </ListItemButton>
               );
             })}
           </List>
@@ -273,9 +312,24 @@ const scheduledNoticeSx: SxProps<Theme> = {
   color: "warning.main",
 };
 
+const experimentalSx: SxProps<Theme> = {
+  display: "flex",
+  alignItems: "center",
+  gap: 1,
+  px: 2,
+  pb: 0.5,
+};
+
+const sourceChipSx: SxProps<Theme> = {
+  ml: 1,
+  flexShrink: 0,
+};
+
 const loadingSx: SxProps<Theme> = {
   display: "flex",
   justifyContent: "center",
+  alignItems: "center",
+  px: 3,
   py: 4,
 };
 

@@ -13,21 +13,28 @@ interface TrackedEtaControlProps {
   routeKey: string;
   seq: number;
   eta: Eta;
+  tracked: boolean;
 }
 
 /**
  * 追蹤班次 action shown next to an ETA row. Turns into a 追蹤中 marker once
  * the row belongs to the tracked trip.
  */
-const TrackedEtaControl = ({ routeKey, seq, eta }: TrackedEtaControlProps) => {
+const TrackedEtaControl = ({
+  routeKey,
+  seq,
+  eta,
+  tracked,
+}: TrackedEtaControlProps) => {
   const { t } = useTranslation();
-  const { trip, canTrack, startTracking, isTrackedEta, openDialog } =
+  const { trip, canTrack, startTracking, openDialog } =
     useContext(BusTrackingContext);
 
   if (navigator.userAgent === "prerendering") return null;
-  if (!canTrack(routeKey, eta.co)) return null;
 
-  if (isTrackedEta(routeKey, seq, eta)) {
+  // the marker must keep showing wherever the tracked bus is, including the
+  // final stop; only starting a new track is disabled there
+  if (tracked) {
     return (
       <Tooltip title={t("你的班次")}>
         <Chip
@@ -42,6 +49,9 @@ const TrackedEtaControl = ({ routeKey, seq, eta }: TrackedEtaControlProps) => {
       </Tooltip>
     );
   }
+
+  // nowhere left to track from the final stop
+  if (!canTrack(routeKey, eta.co, seq)) return null;
 
   const label = trip ? t("改為追蹤此班次") : t("追蹤班次");
   return (

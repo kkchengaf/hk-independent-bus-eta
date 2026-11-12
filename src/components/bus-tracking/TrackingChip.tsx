@@ -63,4 +63,20 @@ const chipSx: SxProps<Theme> = {
   textTransform: "none",
   whiteSpace: "nowrap",
   maxWidth: "calc(100vw - 32px)",
+  // the theme's primary.contrastText is intentionally faint for flat buttons,
+  // so set readable colours for this solid pill explicitly
+  backgroundColor: (theme) =>
+    theme.palette.mode === "light"
+      ? theme.palette.background.paper
+      : theme.palette.primary.main,
+  color: (theme) =>
+    theme.palette.mode === "light" ? theme.palette.text.primary : "#000",
+  border: (theme) =>
+    theme.palette.mode === "light" ? "1px solid rgba(0, 0, 0, 0.23)" : "none",
+  "&.MuiButton-root:hover": {
+    backgroundColor: (theme) =>
+      theme.palette.mode === "light"
+        ? theme.palette.grey[100]
+        : theme.palette.primary.main,
+  },
 };

@@ -3,9 +3,11 @@ import { Eta, fetchEtas } from "hk-bus-eta";
 import AppContext from "../context/AppContext";
 import useLanguage from "./useTranslation";
 import DbContext from "../context/DbContext";
+import BusTrackingContext from "../context/BusTrackingContext";
 
 export const useEtas = (routeId: string, disable: boolean = false) => {
   const { isVisible, refreshInterval } = useContext(AppContext);
+  const { reportEtas } = useContext(BusTrackingContext);
   const {
     db: { routeList, stopList, holidays, serviceDayMap },
   } = useContext(DbContext);
@@ -47,6 +49,13 @@ export const useEtas = (routeId: string, disable: boolean = false) => {
       clearInterval(fetchEtaInterval);
     };
   }, [routeId, fetchData, refreshInterval, disable]);
+
+  // let an active trip consume this ETA list instead of waiting for its own
+  // polling cycle (and avoid showing a duplicate estimate row)
+  useEffect(() => {
+    if (!etas) return;
+    reportEtas?.(routeKey, parseInt(seq, 10), etas);
+  }, [etas, reportEtas, routeKey, seq]);
 
   return etas;
 };
