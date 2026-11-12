@@ -1,5 +1,6 @@
 import { useContext, useMemo } from "react";
-import { Box, SxProps, Theme, Typography } from "@mui/material";
+import { Box, Chip, SxProps, Theme, Typography } from "@mui/material";
+import { DirectionsBus as DirectionsBusIcon } from "@mui/icons-material";
 import { useTranslation } from "react-i18next";
 import AppContext from "../../context/AppContext";
 import { useEtas } from "../../hooks/useEtas";
@@ -8,6 +9,10 @@ import { Eta, Terminal } from "hk-bus-eta";
 import { getPlatformSymbol, getLineColor } from "../../utils";
 import useLanguage from "../../hooks/useTranslation";
 import DbContext from "../../context/DbContext";
+import BusTrackingContext from "../../context/BusTrackingContext";
+import TrackedEtaControl from "../bus-tracking/TrackedEtaControl";
+import { formatHkTime, waitMinutes } from "../../busTracking";
+import type { TrackedStop } from "../../busTracking";
 import { DoubleTrainIcon, SingleTrainIcon } from "../home/SuccinctEtas";
 
 interface TimeReportProps {
@@ -35,7 +40,15 @@ const TimeReport = ({
   const {
     db: { routeList, stopList },
   } = useContext(DbContext);
+  const { getTrackedStop, isTrackedEta } = useContext(BusTrackingContext);
   const etas = useEtas(`${routeId}/${seq}`);
+
+  const trackedStop = getTrackedStop(routeId, seq);
+  const hasTrackedRow = useMemo(
+    () => (etas ?? []).some((eta) => isTrackedEta(routeId, seq, eta)),
+    [etas, isTrackedEta, routeId, seq]
+  );
+  const showTrackedEstimate = !!trackedStop && !trackedStop.passed && !hasTrackedRow;
 
   const { route, co, stops } = routeList[routeId];
   const stopId = Object.values(stops)[0][seq];
@@ -104,8 +117,66 @@ const TimeReport = ({
             routeDests={routeDests}
             showCompany={co.length > 1}
             route={route}
+            routeKey={routeId}
+            seq={seq}
           />
         ))}
+      {showTrackedEstimate && trackedStop && (
+        <TrackedEtaRow stop={trackedStop} />
+      )}
+    </Box>
+  );
+};
+
+interface TrackedEtaRowProps {
+  stop: TrackedStop;
+}
+
+/**
+ * Shown when the tracked bus is no longer among the operator's ETAs for this
+ * stop, so its chained estimate stays visible.
+ */
+const TrackedEtaRow = ({ stop }: TrackedEtaRowProps) => {
+  const { t } = useTranslation();
+  const { etaFormat } = useContext(AppContext);
+  const { openDialog } = useContext(BusTrackingContext);
+  const waitTime = waitMinutes(stop.etaMs);
+  const exactTime = formatHkTime(stop.etaMs);
+
+  return (
+    <Box sx={trackedRowSx}>
+      <Typography variant="subtitle1" sx={{ flex: 1, minWidth: 0 }}>
+        <DirectionsBusIcon fontSize="small" sx={trackedIconSx} />
+        <Box component="span" sx={{ fontSize: "0.8em", mr: 1 }}>
+          {t("你的班次")}
+        </Box>
+        {stop.source === "estimate" && "≈ "}
+        {etaFormat === "exact" && exactTime}
+        {etaFormat !== "exact" && (
+          <>
+            {etaFormat === "mixed" && <>{exactTime}&emsp;</>}
+            <Box
+              component="span"
+              sx={{
+                ...waitTimeSx,
+                color: (theme) => theme.palette.warning.main,
+              }}
+            >
+              {waitTime <= 0 ? " - " : `${waitTime} `}
+            </Box>
+            <Box component="span" sx={{ fontSize: "0.8em" }}>
+              {t("分鐘")}
+            </Box>
+          </>
+        )}
+      </Typography>
+      <Chip
+        size="small"
+        variant="outlined"
+        color="warning"
+        label={stop.source === "estimate" ? t("預計") : t("實時")}
+        onClick={openDialog}
+      />
     </Box>
   );
 };
@@ -115,14 +186,19 @@ interface EtaMsgProps {
   routeDests: Terminal[];
   showCompany: boolean;
   route: string;
+  routeKey: string;
+  seq: number;
 }
 
 const EtaLine = ({
-  eta: { eta, remark, co, dest },
+  eta,
   routeDests,
   showCompany,
   route,
+  routeKey,
+  seq,
 }: EtaMsgProps) => {
+  const { eta: etaTime, remark, co, dest } = eta;
   const { t } = useTranslation();
   const language = useLanguage();
   const { etaFormat, platformMode } = useContext(AppContext);
@@ -143,7 +219,7 @@ const EtaLine = ({
   }, [routeDests, dest, co]);
 
   const waitTime = Math.round(
-    (new Date(eta).getTime() - new Date().getTime()) / 60 / 1000
+    (new Date(etaTime).getTime() - new Date().getTime()) / 60 / 1000
   );
 
   const exactTimeJsx = (
@@ -151,7 +227,7 @@ const EtaLine = ({
       component="span"
       sx={etaFormat !== "exact" ? { fontSize: "0.9em" } : {}}
     >
-      {eta.slice(11, 16)}
+      {etaTime.slice(11, 16)}
     </Box>
   );
 
@@ -185,33 +261,39 @@ const EtaLine = ({
   );
 
   return (
-    <Typography variant="subtitle1" sx={{ justifyContent: "center" }}>
-      {etaFormat === "diff" && waitTimeJsx}
-      {etaFormat === "exact" && exactTimeJsx}
-      {etaFormat === "mixed" && (
-        <>
-          {exactTimeJsx}&emsp;{waitTimeJsx}
-        </>
-      )}
-      {!isTrain && <>&emsp;-&nbsp;</>}
-      <Box
-        component="span"
-        sx={{ fontSize: "0.8em", textOverflow: "ellipsis" }}
+    <Box sx={etaRowSx}>
+      <Typography
+        variant="subtitle1"
+        sx={{ justifyContent: "center", flex: 1, minWidth: 0 }}
       >
-        {showCompany && <>&emsp;{t(co)}</>}
-        &emsp;
-        <EtaRemark
-          remark={remark}
-          co={co}
-          language={language}
-          route={route}
-          platformMode={platformMode}
-        />
-        {isTrain && " "}
-        {!isTrain && <>&emsp;</>}
-        {branchRoute && dest[language]}
-      </Box>
-    </Typography>
+        {etaFormat === "diff" && waitTimeJsx}
+        {etaFormat === "exact" && exactTimeJsx}
+        {etaFormat === "mixed" && (
+          <>
+            {exactTimeJsx}&emsp;{waitTimeJsx}
+          </>
+        )}
+        {!isTrain && <>&emsp;-&nbsp;</>}
+        <Box
+          component="span"
+          sx={{ fontSize: "0.8em", textOverflow: "ellipsis" }}
+        >
+          {showCompany && <>&emsp;{t(co)}</>}
+          &emsp;
+          <EtaRemark
+            remark={remark}
+            co={co}
+            language={language}
+            route={route}
+            platformMode={platformMode}
+          />
+          {isTrain && " "}
+          {!isTrain && <>&emsp;</>}
+          {branchRoute && dest[language]}
+        </Box>
+      </Typography>
+      <TrackedEtaControl routeKey={routeKey} seq={seq} eta={eta} />
+    </Box>
   );
 };
 
@@ -290,4 +372,24 @@ export default TimeReport;
 const waitTimeSx: SxProps<Theme> = {
   fontWeight: "700",
   color: "#088bce",
+};
+
+const etaRowSx: SxProps<Theme> = {
+  display: "flex",
+  alignItems: "center",
+  gap: 0.5,
+};
+
+const trackedRowSx: SxProps<Theme> = {
+  display: "flex",
+  alignItems: "center",
+  gap: 0.5,
+  pl: 1,
+  borderLeft: (theme) => `3px solid ${theme.palette.warning.main}`,
+  backgroundColor: "action.hover",
+};
+
+const trackedIconSx: SxProps<Theme> = {
+  mr: 0.5,
+  verticalAlign: "text-bottom",
 };

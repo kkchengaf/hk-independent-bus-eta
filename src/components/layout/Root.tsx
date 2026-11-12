@@ -16,6 +16,8 @@ import CollectionDialog from "./collections/CollectionDialog";
 import { Suspense, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import PinDialog from "./PinDialog";
+import TrackingChip from "../bus-tracking/TrackingChip";
+import TrackingDialog from "../bus-tracking/TrackingDialog";
 
 const Root = () => {
   const {
@@ -49,6 +51,8 @@ const Root = () => {
       <CollectionDrawer />
       <CollectionDialog />
       <PinDialog />
+      <TrackingChip />
+      <TrackingDialog />
     </Container>
   );
 };
