@@ -30,7 +30,7 @@ import { toProperCase } from "../../utils";
 import {
   formatHkTime,
   formatHkTimestamp,
-  waitMinutes,
+  waitInfo,
 } from "../../busTracking";
 
 /**
@@ -177,21 +177,25 @@ const TrackingDialog = () => {
         ) : (
           <List dense disablePadding>
             {rows.map((stop) => {
-              const isNext = stop.seq === nextSeq;
+              const wait = waitInfo(stop.etaMs);
+              const isNext =
+                stop.seq === nextSeq && !stop.passed && wait.state !== "past";
               const exact = formatHkTime(stop.etaMs);
-              const minutes = waitMinutes(stop.etaMs);
+              const isGone = stop.passed || wait.state === "past";
               const waitText =
-                minutes <= 0
+                wait.state === "future"
+                  ? `${wait.minutes} ${t("分鐘")}`
+                  : wait.state === "arriving"
                   ? t("即將抵達")
-                  : `${minutes} ${t("分鐘")}`;
-              const etaText = stop.passed
+                  : t("已過");
+              const etaText = isGone
                 ? exact
                 : etaFormat === "exact"
                 ? exact
                 : etaFormat === "diff"
                 ? waitText
                 : `${exact}\u3000${waitText}`;
-              const sourceLabel = stop.passed
+              const sourceLabel = isGone
                 ? t("已過")
                 : stop.source === "estimate"
                 ? t("預計")

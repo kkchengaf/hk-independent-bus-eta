@@ -47,12 +47,6 @@ export interface EtaPoint {
   dest: LocalizedText;
 }
 
-export interface EtaMatch {
-  prevIdx: number;
-  currIdx: number;
-  segmentMs: number;
-}
-
 /** companies supported by fetchEstJourneyTime and with usable trip-level ETAs */
 export const TRACKABLE_COMPANIES: Company[] = [
   "kmb",
@@ -71,8 +65,6 @@ export const PASS_GRACE_MS = 2 * 60_000;
 /** an estimated arrival must be this stale before it is treated as passed */
 export const ESTIMATE_PASS_GRACE_MS = 10 * 60_000;
 
-const MATCH_TOLERANCE_MIN_MS = 2 * 60_000;
-const MATCH_TOLERANCE_MAX_MS = 6 * 60_000;
 const MAX_JT_SEGMENTS = 80;
 const JT_CACHE_TTL_MS = 30 * 60_000;
 const JT_CONCURRENCY = 6;
@@ -95,8 +87,24 @@ export const formatHkTime = (etaMs: number): string =>
 export const formatHkTimestamp = (ms: number): string =>
   new Date(ms + 8 * 60 * 60 * 1000).toISOString().slice(11, 19);
 
-export const waitMinutes = (etaMs: number, now = Date.now()): number =>
-  Math.max(0, Math.round((etaMs - now) / 60_000));
+/** how an arrival should be worded: left to come, imminent, or already gone */
+export type WaitState = "future" | "arriving" | "past";
+
+export interface WaitInfo {
+  state: WaitState;
+  minutes: number;
+}
+
+/**
+ * A stale projection must never render as "- 分鐘" or a permanent
+ * "即將抵達"; anything more than a minute overdue is already gone.
+ */
+export const waitInfo = (etaMs: number, now = Date.now()): WaitInfo => {
+  const remainingMs = etaMs - now;
+  if (remainingMs < -60_000) return { state: "past", minutes: 0 };
+  if (remainingMs < 60_000) return { state: "arriving", minutes: 0 };
+  return { state: "future", minutes: Math.round(remainingMs / 60_000) };
+};
 
 export const isScheduledRemark = (remark: Eta["remark"]): boolean =>
   !!remark && (remark.zh?.endsWith("班次") || remark.en?.endsWith("Scheduled Bus"));
@@ -142,127 +150,18 @@ export const buildEtaPoints = (
   return chosen.sort((a, b) => a.etaMs - b.etaMs);
 };
 
-export const findClosestIndex = (
-  points: EtaPoint[],
-  targetMs: number,
-  toleranceMs: number
-): number => {
-  let best = -1;
-  let bestDiff = toleranceMs;
-  points.forEach((point, idx) => {
-    const diff = Math.abs(point.etaMs - targetMs);
-    if (diff <= bestDiff) {
-      best = idx;
-      bestDiff = diff;
-    }
-  });
-  return best;
-};
+export const DEFAULT_HEADWAY_MS = 6 * 60_000;
 
-export const matchToleranceMs = (
+/** typical spacing between consecutive buses at a stop */
+export const headwayOf = (
   points: EtaPoint[],
-  expectedSegmentMs: number | null
+  fallbackMs = DEFAULT_HEADWAY_MS
 ): number => {
   const gaps: number[] = [];
   for (let i = 1; i < points.length; i++) {
     gaps.push(points[i].etaMs - points[i - 1].etaMs);
   }
-  const headway = gaps.length
-    ? median(gaps)
-    : (expectedSegmentMs ?? 8 * 60_000) * 2;
-  return clamp(
-    headway / 2,
-    MATCH_TOLERANCE_MIN_MS,
-    MATCH_TOLERANCE_MAX_MS
-  );
-};
-
-/**
- * Match the ETA list of the current stop against the previous stop's list.
- * Holds the trip order (no overtaking) and allows trips to appear at the
- * front (already passed the previous stop) or drop out of the top 3.
- */
-export const alignEtas = (
-  prev: EtaPoint[],
-  curr: EtaPoint[],
-  expectedSegmentMs: number,
-  toleranceMs: number
-): EtaMatch[] => {
-  const used = new Set<number>();
-  const matches: EtaMatch[] = [];
-
-  for (let currIdx = 0; currIdx < curr.length; currIdx++) {
-    let bestIdx = -1;
-    let bestDiff = toleranceMs;
-    for (let prevIdx = 0; prevIdx < prev.length; prevIdx++) {
-      if (used.has(prevIdx)) continue;
-      const diff = Math.abs(
-        curr[currIdx].etaMs - (prev[prevIdx].etaMs + expectedSegmentMs)
-      );
-      if (diff <= bestDiff) {
-        bestIdx = prevIdx;
-        bestDiff = diff;
-      }
-    }
-    if (bestIdx >= 0) {
-      used.add(bestIdx);
-      matches.push({
-        prevIdx: bestIdx,
-        currIdx,
-        segmentMs: curr[currIdx].etaMs - prev[bestIdx].etaMs,
-      });
-    }
-  }
-
-  return matches;
-};
-
-/**
- * Segment time of the bus immediately ahead of ours (the bus that was
- * closest before our predicted arrival at the previous stop). Falls back to
- * the closest matched bus behind ours, then null.
- */
-export const pickReferenceSegment = (
-  matches: EtaMatch[],
-  prev: EtaPoint[],
-  ourPrevEtaMs: number
-): number | null => {
-  let ahead: { etaMs: number; segmentMs: number } | null = null;
-  let behind: { etaMs: number; segmentMs: number } | null = null;
-
-  for (const match of matches) {
-    const prevEtaMs = prev[match.prevIdx].etaMs;
-    if (!Number.isFinite(match.segmentMs) || match.segmentMs <= 0) continue;
-    if (prevEtaMs <= ourPrevEtaMs + 30_000) {
-      if (!ahead || prevEtaMs > ahead.etaMs) {
-        ahead = { etaMs: prevEtaMs, segmentMs: match.segmentMs };
-      }
-    } else if (!behind || prevEtaMs < behind.etaMs) {
-      behind = { etaMs: prevEtaMs, segmentMs: match.segmentMs };
-    }
-  }
-
-  return (ahead ?? behind)?.segmentMs ?? null;
-};
-
-export const clampSegmentMs = (
-  segmentMs: number,
-  expectedSegmentMs: number | null
-): number =>
-  expectedSegmentMs != null && expectedSegmentMs > 0
-    ? clamp(segmentMs, expectedSegmentMs * 0.45, expectedSegmentMs * 2)
-    : Math.max(0, segmentMs);
-
-export const nextArrivalMs = (
-  prevEtaMs: number,
-  expectedSegmentMs: number | null,
-  referenceSegmentMs: number | null
-): number | null => {
-  if (referenceSegmentMs != null) {
-    return prevEtaMs + clampSegmentMs(referenceSegmentMs, expectedSegmentMs);
-  }
-  if (expectedSegmentMs != null) return prevEtaMs + expectedSegmentMs;
-  return null;
+  return gaps.length ? median(gaps) : fallbackMs;
 };
 
 /** cumulative journey-time profile (minutes) from `startSeq`, indexed by offset */
@@ -314,6 +213,337 @@ export const canTrackStop = (
   if (!route || !canTrackRoute(route, co)) return false;
   const stopIds = Object.values(route.stops)[0] ?? [];
   return seq >= 0 && seq < stopIds.length - 1;
+};
+
+/* ------------------------------------------------------------------ *
+ * Route-wide bus track table
+ *
+ * Every stop only exposes the next few buses, and a congested segment can
+ * hide a bus completely. Instead of following one chain forward, keep a
+ * table of buses (rows) against stops (columns) and keep it alive between
+ * refreshes. Rows are built from the last stop backwards, where arrival
+ * order is stable, so a bus that "disappears" leaves a hole in a known row
+ * instead of being confused with its neighbour.
+ * ------------------------------------------------------------------ */
+
+export interface TrackCell {
+  seq: number;
+  etaMs: number;
+  etaStr: string;
+  scheduled: boolean;
+}
+
+export interface BusTrack {
+  id: number;
+  cells: Map<number, TrackCell>;
+}
+
+export interface TrackTable {
+  tracks: BusTrack[];
+  /** observed travel time / static journey time, per segment start */
+  factors: Map<number, number>;
+  /** median observed segment time across the table */
+  medianFactor: number;
+}
+
+export interface BuildTrackTableOptions {
+  /** stops that currently have a fresh ETA list, ascending */
+  seqs: number[];
+  lists: Map<number, EtaPoint[]>;
+  /** static journey time between two stops, from the journey profile */
+  staticSegmentMs: (fromSeq: number, toSeq: number) => number | null;
+  fallbackHeadwayMs?: number;
+}
+
+/** observations never associate further apart than this */
+const TRACK_ASSOCIATION_CAP_MS = 45 * 60_000;
+/** ETA rounding can make the next stop look slightly earlier */
+const TRACK_EARLY_SLACK_MS = 60_000;
+/** segments this long are checked against a minimum plausible speed */
+const TRACK_LONG_SEGMENT_MS = 5 * 60_000;
+
+/**
+ * Build the bus/stop table. Buses are laid out along the columns from the
+ * furthest known stop backwards, preserving order: a bus can never overtake
+ * another, so each row can only claim a later column than the row before it.
+ */
+export const buildTrackTable = ({
+  seqs,
+  lists,
+  staticSegmentMs,
+  fallbackHeadwayMs = DEFAULT_HEADWAY_MS,
+}: BuildTrackTableOptions): TrackTable => {
+  const tracks: BusTrack[] = [];
+  const factors = new Map<number, number>();
+  const sortedSeqs = [...seqs].sort((a, b) => a - b);
+
+  let nextId = 1;
+  for (let i = sortedSeqs.length - 1; i >= 0; i--) {
+    const seq = sortedSeqs[i];
+    const rows = lists.get(seq) ?? [];
+    if (rows.length === 0) continue;
+
+    const nextSeq = i + 1 < sortedSeqs.length ? sortedSeqs[i + 1] : null;
+    const expected =
+      nextSeq != null ? staticSegmentMs(seq, nextSeq) : null;
+    const headway = headwayOf(rows, fallbackHeadwayMs);
+    // a bus cannot cover a long segment in a fraction of its journey time,
+    // and cannot take much longer than the worst congestion we accept
+    const minDeltaMs =
+      expected != null && expected >= TRACK_LONG_SEGMENT_MS
+        ? expected * 0.4
+        : 0;
+    const maxDeltaMs =
+      expected != null
+        ? Math.min(
+            Math.max(3 * 60_000, expected * 1.8),
+            TRACK_ASSOCIATION_CAP_MS
+          )
+        : Math.max(10 * 60_000, headway * 2);
+
+    let cursorEtaMs = Number.NEGATIVE_INFINITY;
+    const claimed = new Set<number>();
+
+    for (const row of rows) {
+      let best: BusTrack | null = null;
+      let bestDiff = Number.POSITIVE_INFINITY;
+
+      for (const track of tracks) {
+        if (claimed.has(track.id)) continue;
+        if (nextSeq == null) continue;
+        const cell = track.cells.get(nextSeq);
+        if (!cell) continue;
+        if (cell.etaMs < cursorEtaMs) continue;
+        const delta = cell.etaMs - row.etaMs;
+        if (delta < minDeltaMs - TRACK_EARLY_SLACK_MS) continue;
+        if (delta > maxDeltaMs) continue;
+        const diff = Math.abs(delta - (expected ?? delta));
+        if (diff < bestDiff) {
+          best = track;
+          bestDiff = diff;
+        }
+      }
+
+      const cell: TrackCell = {
+        seq,
+        etaMs: row.etaMs,
+        etaStr: row.etaStr,
+        scheduled: row.scheduled,
+      };
+
+      if (best && nextSeq != null) {
+        best.cells.set(seq, cell);
+        claimed.add(best.id);
+        cursorEtaMs = best.cells.get(nextSeq)!.etaMs;
+      } else {
+        tracks.push({ id: nextId++, cells: new Map([[seq, cell]]) });
+      }
+    }
+  }
+
+  // observed speed per segment; this is the "alpha" over the journey-time model
+  const samples = new Map<number, number[]>();
+  for (const track of tracks) {
+    const stops = [...track.cells.keys()].sort((a, b) => a - b);
+    for (const seq of stops) {
+      const cell = track.cells.get(seq)!;
+      const nextCell = track.cells.get(seq + 1);
+      if (!nextCell) continue;
+      const expected = staticSegmentMs(seq, seq + 1);
+      if (expected == null || expected <= 0) continue;
+      const observed = nextCell.etaMs - cell.etaMs;
+      if (observed <= 0) continue;
+      const list = samples.get(seq) ?? [];
+      list.push(observed / expected);
+      samples.set(seq, list);
+    }
+  }
+
+  const allSamples: number[] = [];
+  for (const [seq, values] of samples) {
+    const factor = clamp(median(values), 1, 3);
+    factors.set(seq, factor);
+    allSamples.push(...values);
+  }
+
+  return {
+    tracks,
+    factors,
+    medianFactor: allSamples.length
+      ? clamp(median(allSamples), 1, 3)
+      : 1,
+  };
+};
+
+/** the track that owns the ETA row at `seq` (our bus, at the start) */
+export const findTrackByCell = (
+  table: TrackTable,
+  seq: number,
+  etaMs: number,
+  toleranceMs = 90_000
+): BusTrack | null => {
+  let best: BusTrack | null = null;
+  let bestDiff = toleranceMs;
+  for (const track of table.tracks) {
+    const cell = track.cells.get(seq);
+    if (!cell) continue;
+    const diff = Math.abs(cell.etaMs - etaMs);
+    if (diff <= bestDiff) {
+      best = track;
+      bestDiff = diff;
+    }
+  }
+  return best;
+};
+
+export interface ProjectTrackOptions {
+  track: BusTrack;
+  boardSeq: number;
+  lastSeq: number;
+  staticSegmentMs: (fromSeq: number, toSeq: number) => number | null;
+  factors: Map<number, number>;
+  medianFactor: number;
+  now: number;
+  /** cells of every other bus at a stop, used to re-acquire a hidden bus */
+  otherCells?: (seq: number) => TrackCell[];
+}
+
+export interface ProjectTrackResult {
+  stops: TrackedStop[];
+  /** stops where another bus was adopted as ours */
+  adopted: number[];
+}
+
+/**
+ * Turn a row of the table into the per-stop series we display. Holes are
+ * interpolated between the row's own sightings, and extrapolated with the
+ * journey time scaled by the congestion factor observed on that segment.
+ * When another bus appears exactly where ours is due, it is adopted so the
+ * ride continues after a congested black spot.
+ */
+export const projectTrack = ({
+  track,
+  boardSeq,
+  lastSeq,
+  staticSegmentMs,
+  factors,
+  medianFactor,
+  now,
+  otherCells,
+}: ProjectTrackOptions): ProjectTrackResult => {
+  const cells = track.cells;
+  const knownSeqs = [...cells.keys()].sort((a, b) => a - b);
+  const adopted: number[] = [];
+  if (knownSeqs.length === 0) return { stops: [], adopted };
+
+  const factorOf = (fromSeq: number, toSeq: number): number => {
+    let factor = 1;
+    for (let s = fromSeq; s < toSeq; s++) {
+      factor *= factors.get(s) ?? medianFactor;
+    }
+    return factor;
+  };
+
+  const expectedMs = (fromSeq: number, toSeq: number): number | null => {
+    const base = staticSegmentMs(fromSeq, toSeq);
+    if (base == null) return null;
+    return base * factorOf(fromSeq, toSeq);
+  };
+
+  const result: TrackedStop[] = [];
+  let prevEtaMs = Number.NEGATIVE_INFINITY;
+
+  for (let seq = boardSeq; seq <= lastSeq; seq++) {
+    const cell = cells.get(seq);
+    if (cell) {
+      result.push({
+        seq,
+        eta: cell.etaStr,
+        etaMs: cell.etaMs,
+        source: cell.scheduled ? "scheduled" : "realtime",
+        passed: false,
+        updatedAt: now,
+      });
+      prevEtaMs = Math.max(prevEtaMs, cell.etaMs);
+      continue;
+    }
+
+    const before = [...knownSeqs].reverse().find((s) => s < seq);
+    const after = knownSeqs.find((s) => s > seq);
+    const stepMs =
+      before != null ? expectedMs(before, seq) : null;
+    let etaMs: number | null = null;
+
+    if (before != null && after != null) {
+      // interpolate between two sightings of the same bus
+      const span = expectedMs(before, after);
+      const part = expectedMs(before, seq);
+      if (span != null && part != null && span > 0) {
+        const beforeEta = cells.get(before)!.etaMs;
+        const afterEta = cells.get(after)!.etaMs;
+        etaMs = beforeEta + ((afterEta - beforeEta) * part) / span;
+      }
+    } else if (before != null && stepMs != null) {
+      etaMs = cells.get(before)!.etaMs + stepMs;
+    } else if (before == null && after != null) {
+      const step = expectedMs(seq, after);
+      if (step != null) etaMs = cells.get(after)!.etaMs - step;
+    }
+
+    // re-acquire the bus when another row lands where ours is due
+    if (otherCells) {
+      const reference =
+        etaMs ??
+        (before != null ? cells.get(before)!.etaMs + (stepMs ?? 0) : null);
+      if (reference != null) {
+        const tolerance = Math.max(
+          2 * 60_000,
+          (stepMs ?? 0) * 0.35
+        );
+        const lowerBound = Number.isFinite(prevEtaMs)
+          ? prevEtaMs
+          : Number.NEGATIVE_INFINITY;
+        const candidates = otherCells(seq)
+          .filter((candidate) => candidate.etaMs >= lowerBound)
+          .sort(
+            (a, b) =>
+              Math.abs(a.etaMs - reference) - Math.abs(b.etaMs - reference)
+          );
+        const candidate = candidates[0];
+        if (
+          candidate &&
+          Math.abs(candidate.etaMs - reference) <= tolerance
+        ) {
+          cells.set(seq, candidate);
+          adopted.push(seq);
+          result.push({
+            seq,
+            eta: candidate.etaStr,
+            etaMs: candidate.etaMs,
+            source: candidate.scheduled ? "scheduled" : "realtime",
+            passed: false,
+            updatedAt: now,
+          });
+          prevEtaMs = Math.max(prevEtaMs, candidate.etaMs);
+          continue;
+        }
+      }
+    }
+
+    if (etaMs == null) break;
+    if (Number.isFinite(prevEtaMs)) etaMs = Math.max(etaMs, prevEtaMs);
+    result.push({
+      seq,
+      eta: new Date(etaMs).toISOString(),
+      etaMs,
+      source: "estimate",
+      passed: false,
+      updatedAt: now,
+    });
+    prevEtaMs = etaMs;
+  }
+
+  return { stops: result, adopted };
 };
 
 export interface LoadJourneyProfileOptions {

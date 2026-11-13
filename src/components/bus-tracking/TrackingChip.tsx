@@ -8,7 +8,7 @@ import {
 import { useTranslation } from "react-i18next";
 import BusTrackingContext from "../../context/BusTrackingContext";
 import DbContext from "../../context/DbContext";
-import { waitMinutes } from "../../busTracking";
+import { waitInfo } from "../../busTracking";
 
 /**
  * Floating entry point that keeps the tracked trip reachable on every page.
@@ -25,12 +25,13 @@ const TrackingChip = () => {
 
   const route = routeList[trip.routeKey];
   const next = nextSeq != null ? stops[nextSeq] : null;
-  const minutes = next ? waitMinutes(next.etaMs) : null;
+  const wait = next ? waitInfo(next.etaMs) : null;
 
   let status: string;
   if (isComplete) status = t("已到達終點站");
-  else if (minutes != null && minutes <= 0) status = t("即將抵達");
-  else if (minutes != null) status = `${t("下一站")} ${minutes} ${t("分鐘")}`;
+  else if (wait?.state === "arriving") status = t("即將抵達");
+  else if (wait?.state === "future")
+    status = `${t("下一站")} ${wait.minutes} ${t("分鐘")}`;
   else status = t("追蹤中");
 
   return (

@@ -11,7 +11,7 @@ import useLanguage from "../../hooks/useTranslation";
 import DbContext from "../../context/DbContext";
 import BusTrackingContext from "../../context/BusTrackingContext";
 import TrackedEtaControl from "../bus-tracking/TrackedEtaControl";
-import { formatHkTime, waitMinutes } from "../../busTracking";
+import { formatHkTime, waitInfo } from "../../busTracking";
 import type { TrackedStop } from "../../busTracking";
 import { DoubleTrainIcon, SingleTrainIcon } from "../home/SuccinctEtas";
 
@@ -143,8 +143,14 @@ const TrackedEtaRow = ({ stop }: TrackedEtaRowProps) => {
   const { t } = useTranslation();
   const { etaFormat } = useContext(AppContext);
   const { openDialog } = useContext(BusTrackingContext);
-  const waitTime = waitMinutes(stop.etaMs);
+  const wait = waitInfo(stop.etaMs);
   const exactTime = formatHkTime(stop.etaMs);
+  const waitText =
+    wait.state === "future"
+      ? `${wait.minutes} `
+      : wait.state === "arriving"
+      ? t("即將抵達")
+      : t("已過");
 
   return (
     <Box sx={trackedRowSx}>
@@ -153,9 +159,20 @@ const TrackedEtaRow = ({ stop }: TrackedEtaRowProps) => {
         <Box component="span" sx={{ fontSize: "0.8em", mr: 1 }}>
           {t("你的班次")}
         </Box>
-        {stop.source === "estimate" && "≈ "}
+        {stop.source === "estimate" && wait.state === "future" && "≈ "}
         {etaFormat === "exact" && exactTime}
-        {etaFormat !== "exact" && (
+        {etaFormat !== "exact" && wait.state !== "future" && (
+          <Box
+            component="span"
+            sx={{
+              fontSize: "0.9em",
+              color: "text.secondary",
+            }}
+          >
+            {exactTime}&emsp;{waitText}
+          </Box>
+        )}
+        {etaFormat !== "exact" && wait.state === "future" && (
           <>
             {etaFormat === "mixed" && <>{exactTime}&emsp;</>}
             <Box
@@ -165,7 +182,7 @@ const TrackedEtaRow = ({ stop }: TrackedEtaRowProps) => {
                 color: (theme) => theme.palette.warning.main,
               }}
             >
-              {waitTime <= 0 ? " - " : `${waitTime} `}
+              {waitText}
             </Box>
             <Box component="span" sx={{ fontSize: "0.8em" }}>
               {t("分鐘")}
@@ -177,7 +194,13 @@ const TrackedEtaRow = ({ stop }: TrackedEtaRowProps) => {
         size="small"
         variant="outlined"
         color="warning"
-        label={stop.source === "estimate" ? t("預計") : t("實時")}
+        label={
+          wait.state === "past"
+            ? t("已過")
+            : stop.source === "estimate"
+            ? t("預計")
+            : t("實時")
+        }
         onClick={openDialog}
       />
     </Box>
