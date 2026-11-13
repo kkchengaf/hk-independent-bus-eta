@@ -36,6 +36,10 @@ const PROFILE_AHEAD_THRESHOLD = 10;
 const LISTS_MAX_AGE_MS = 3 * 60_000;
 /** the pinned boarding cell may coincide with an operator row this closely */
 const ANCHOR_MATCH_MS = 60_000;
+/** weight of this cycle's congestion measurement when smoothing */
+const ALPHA_WEIGHT = 0.3;
+/** a segment congestion factor is forgotten when it stops being measured */
+const ALPHA_TTL_MS = 30 * 60_000;
 
 export interface BusTrackingResult {
   stops: Record<number, TrackedStop>;
@@ -75,6 +79,8 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
    * that our bus was there and re-adopts whichever bus comes next.
    */
   const settledRef = useRef(new Map<number, TrackCell>());
+  /** per-segment congestion ratios, smoothed across refresh cycles */
+  const alphasRef = useRef(new Map<number, { value: number; ts: number }>());
   /** stops where our bus has been really seen, for window widening */
   const seenSeqsRef = useRef(new Set<number>());
   const windowStepRef = useRef(0);
@@ -102,6 +108,7 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     listSignaturesRef.current = new Map();
     arrivalsRef.current = new Map();
     settledRef.current = new Map();
+    alphasRef.current = new Map();
     seenSeqsRef.current = new Set();
     windowStepRef.current = 0;
     profileRef.current = null;
@@ -145,6 +152,7 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
       etaMs: anchorMs,
       etaStr: trip.anchorEta,
       scheduled: trip.anchorSource === "scheduled",
+      real: true,
     };
 
     // 1. Build the bus/stop table from the lists we hold. The pinned boarding
@@ -173,11 +181,25 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
       );
     }
 
+    const previousAlphas = new Map<number, number>();
+    for (const [seq, record] of alphasRef.current) {
+      if (now - record.ts <= ALPHA_TTL_MS) previousAlphas.set(seq, record.value);
+    }
+
     const table = buildTrackTable({
       seqs: [...lists.keys()],
       lists,
       staticSegmentMs,
+      previousAlphas,
+      alphaWeight: ALPHA_WEIGHT,
     });
+
+    // remember this cycle's measurements; segments that were not re-measured
+    // keep their older timestamp and expire on their own
+    for (const seq of table.freshSegments) {
+      const value = table.segmentAlphas.get(seq);
+      if (value != null) alphasRef.current.set(seq, { value, ts: now });
+    }
 
     // 2. Our row is the one holding that pinned cell. Arrivals the bus has
     //    already reached are re-attached: the operator drops a stop's ETA once
@@ -199,6 +221,7 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
       lastSeq,
       boardCell,
       staticSegmentMs,
+      segmentAlphas: table.segmentAlphas,
       alpha: table.alpha,
       now,
       candidatesAt: (seq) =>
@@ -242,6 +265,7 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
           etaMs: stop.etaMs,
           etaStr: stop.eta,
           scheduled: stop.source === "scheduled",
+          real: stop.source !== "estimate",
         });
       }
     }

@@ -81,6 +81,34 @@ const median = (values: number[]): number => {
     : (sorted[mid - 1] + sorted[mid]) / 2;
 };
 
+interface WeightedSample {
+  ratio: number;
+  weight: number;
+}
+
+/** median where each sample can carry a weight (used for diluted samples) */
+const weightedMedian = (samples: WeightedSample[]): number => {
+  if (samples.length === 0) return 1;
+  const sorted = [...samples].sort((a, b) => a.ratio - b.ratio);
+  const total = sorted.reduce((acc, sample) => acc + sample.weight, 0);
+  if (!(total > 0)) return sorted[sorted.length >> 1].ratio;
+
+  const half = total / 2;
+  let running = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const before = running;
+    running += sorted[i].weight;
+    if (running < half) continue;
+    // a tie straddling the midpoint is averaged, exactly like an even-count median
+    const next = sorted[i + 1];
+    if (next && before < half && running === half) {
+      return (sorted[i].ratio + next.ratio) / 2;
+    }
+    return sorted[i].ratio;
+  }
+  return sorted[sorted.length - 1].ratio;
+};
+
 export const formatHkTime = (etaMs: number): string =>
   new Date(etaMs + 8 * 60 * 60 * 1000).toISOString().slice(11, 16);
 
@@ -203,6 +231,12 @@ export interface TrackCell {
   etaMs: number;
   etaStr: string;
   scheduled: boolean;
+  /**
+   * false when the value came from our own projection rather than from the
+   * operator. Only real cells may be used to learn congestion, otherwise the
+   * estimate would be fed back into itself.
+   */
+  real: boolean;
 }
 
 export interface BusTrack {
@@ -212,8 +246,12 @@ export interface BusTrack {
 
 export interface TrackTable {
   tracks: BusTrack[];
-  /** observed travel time / journey time, applied once to any estimate */
+  /** median observed travel time / journey time across the fleet */
   alpha: number;
+  /** congestion ratio per segment (keyed by the segment's from-stop) */
+  segmentAlphas: Map<number, number>;
+  /** segments that produced a measurement this cycle */
+  freshSegments: Set<number>;
 }
 
 export interface BuildTrackTableOptions {
@@ -222,6 +260,10 @@ export interface BuildTrackTableOptions {
   lists: Map<number, EtaPoint[]>;
   /** static journey time between two stops, from the journey profile */
   staticSegmentMs: (fromSeq: number, toSeq: number) => number | null;
+  /** congestion ratios kept from the previous cycle, for smoothing */
+  previousAlphas?: Map<number, number>;
+  /** weight given to this cycle's measurement when smoothing */
+  alphaWeight?: number;
 }
 
 /**
@@ -249,6 +291,8 @@ export const buildTrackTable = ({
   seqs,
   lists,
   staticSegmentMs,
+  previousAlphas,
+  alphaWeight = 0.3,
 }: BuildTrackTableOptions): TrackTable => {
   const tracks: BusTrack[] = [];
   const sortedSeqs = [...seqs].sort((a, b) => a - b);
@@ -279,6 +323,7 @@ export const buildTrackTable = ({
         etaMs: row.etaMs,
         etaStr: row.etaStr,
         scheduled: row.scheduled,
+        real: true,
       };
 
       let best: BusTrack | null = null;
@@ -311,28 +356,101 @@ export const buildTrackTable = ({
     }
   }
 
-  // observed speed across the whole table; this is the single "alpha" applied
-  // to the journey time when a stop has to be estimated. It is capped at 2x
-  // because the association floor already allows arbitrarily late buses, and
-  // an inflated alpha would stretch every remaining hop.
-  const allSamples: number[] = [];
+  // congestion is measured per segment from real ETAs: two cells in the same
+  // row are one bus's observed travel across that stretch of road
+  const strictSamples = new Map<number, number[]>();
+  const dilutedSamples = new Map<number, WeightedSample[]>();
+  const allRatios: number[] = [];
+  const addStrict = (seq: number, ratio: number) => {
+    const list = strictSamples.get(seq);
+    if (list) list.push(ratio);
+    else strictSamples.set(seq, [ratio]);
+  };
+  const addDiluted = (seq: number, sample: WeightedSample) => {
+    const list = dilutedSamples.get(seq);
+    if (list) list.push(sample);
+    else dilutedSamples.set(seq, [sample]);
+  };
+
   for (const track of tracks) {
     const known = [...track.cells.keys()].sort((a, b) => a - b);
     for (let i = 1; i < known.length; i++) {
       const from = known[i - 1];
       const to = known[i];
-      const expected = staticSegmentMs(from, to);
-      if (expected == null || expected <= 0) continue;
-      const observed = track.cells.get(to)!.etaMs - track.cells.get(from)!.etaMs;
+      const a = track.cells.get(from)!;
+      const b = track.cells.get(to)!;
+      // timetabled ETAs say nothing about traffic, and our own projections
+      // must never feed back into the ratio
+      if (!a.real || !b.real || a.scheduled || b.scheduled) continue;
+      const spanMs = staticSegmentMs(from, to);
+      if (spanMs == null || spanMs <= 0) continue;
+      const observed = b.etaMs - a.etaMs;
       if (!Number.isFinite(observed) || observed <= 0) continue;
-      allSamples.push(observed / expected);
+
+      const ratio = observed / spanMs;
+      allRatios.push(ratio);
+
+      if (to === from + 1) {
+        addStrict(from, ratio);
+      } else {
+        // only the average over several segments is known; credit it to each
+        // of them in proportion to their share of the span
+        for (let s = from; s < to; s++) {
+          const segMs = staticSegmentMs(s, s + 1);
+          if (segMs == null || segMs <= 0) continue;
+          addDiluted(s, { ratio, weight: segMs / spanMs });
+        }
+      }
     }
   }
 
-  return {
-    tracks,
-    alpha: allSamples.length ? clamp(median(allSamples), 1, 2) : 1,
-  };
+  const alpha = allRatios.length ? clamp(median(allRatios), 1, 2) : 1;
+
+  const segmentAlphas = new Map<number, number>();
+  const freshSegments = new Set<number>();
+  const measuredSeqs = new Set([
+    ...strictSamples.keys(),
+    ...dilutedSamples.keys(),
+  ]);
+
+  for (const seq of measuredSeqs) {
+    const strict = strictSamples.get(seq) ?? [];
+    let value: number;
+    if (strict.length >= 2) {
+      // two independent observations are enough to trust the segment
+      value = median(strict);
+    } else {
+      const merged: WeightedSample[] = [
+        ...strict.map<WeightedSample>((ratio) => ({ ratio, weight: 1 })),
+        ...(dilutedSamples.get(seq) ?? []),
+      ];
+      if (merged.length === 0) continue;
+      value = weightedMedian(merged);
+    }
+    segmentAlphas.set(seq, clamp(value, 1, 2));
+    freshSegments.add(seq);
+  }
+
+  // smooth against the previous cycle; a single refresh is too short to
+  // rewrite what we know about the road, and the sample set rotates as the
+  // polling window moves
+  for (const [seq, value] of segmentAlphas) {
+    const previous = previousAlphas?.get(seq);
+    if (previous == null) continue;
+    segmentAlphas.set(
+      seq,
+      clamp(previous * (1 - alphaWeight) + value * alphaWeight, 1, 2)
+    );
+  }
+  // keep segments that produced nothing this cycle, so a stop leaving the
+  // window does not instantly fall back to the fleet average
+  if (previousAlphas) {
+    for (const [seq, previous] of previousAlphas) {
+      if (!segmentAlphas.has(seq)) segmentAlphas.set(seq, previous);
+    }
+  }
+
+  return { tracks, alpha, segmentAlphas, freshSegments };
 };
 
 /**
@@ -367,7 +485,9 @@ export interface ProjectTrackOptions {
   /** the pinned ETA of the tracked bus at the boarding stop */
   boardCell: TrackCell;
   staticSegmentMs: (fromSeq: number, toSeq: number) => number | null;
-  /** travel time / journey time observed across the fleet, >= 1 */
+  /** congestion ratio per segment, measured from the table */
+  segmentAlphas: Map<number, number>;
+  /** fleet-wide fallback for segments with no measurement */
   alpha: number;
   now: number;
   /** cells of every other bus at a stop, used to re-acquire our bus */
@@ -397,6 +517,7 @@ export const projectTrack = ({
   lastSeq,
   boardCell,
   staticSegmentMs,
+  segmentAlphas,
   alpha,
   now,
   candidatesAt,
@@ -404,26 +525,36 @@ export const projectTrack = ({
   const adopted: number[] = [];
   const result: TrackedStop[] = [];
 
-  // prefer the speed our own row has shown so far, else the fleet's
-  const ownRatios: number[] = [];
+  // our own bus knows its segments best, when it has been seen on them
+  const ownAlphas = new Map<number, number>();
   const ownSeqs = [...track.cells.keys()].sort((a, b) => a - b);
   for (let i = 1; i < ownSeqs.length; i++) {
     const from = ownSeqs[i - 1];
     const to = ownSeqs[i];
-    const expected = staticSegmentMs(from, to);
-    if (expected == null || expected <= 0) continue;
-    const observed =
-      track.cells.get(to)!.etaMs - track.cells.get(from)!.etaMs;
+    if (to !== from + 1) continue;
+    const a = track.cells.get(from)!;
+    const b = track.cells.get(to)!;
+    if (!a.real || !b.real || a.scheduled || b.scheduled) continue;
+    const jt = staticSegmentMs(from, to);
+    if (jt == null || jt <= 0) continue;
+    const observed = b.etaMs - a.etaMs;
     if (!Number.isFinite(observed) || observed <= 0) continue;
-    ownRatios.push(observed / expected);
+    ownAlphas.set(from, clamp(observed / jt, 1, 2));
   }
-  const congestion = clamp(ownRatios.length ? median(ownRatios) : alpha, 1, 2);
+
+  const alphaOf = (seq: number): number =>
+    ownAlphas.get(seq) ?? segmentAlphas.get(seq) ?? alpha;
 
   const makeObserved = (seq: number, cell: TrackCell): TrackedStop => ({
     seq,
     eta: cell.etaStr,
     etaMs: cell.etaMs,
-    source: cell.scheduled ? "scheduled" : "realtime",
+    // a remembered projection keeps saying so instead of looking like live data
+    source: !cell.real
+      ? "estimate"
+      : cell.scheduled
+      ? "scheduled"
+      : "realtime",
     passed: false,
     updatedAt: now,
   });
@@ -434,12 +565,34 @@ export const projectTrack = ({
   let publishedEtaMs = boardCell.etaMs;
   if (!Number.isFinite(publishedEtaMs)) return { stops: [], adopted };
 
+  // running totals from the current anchor, so the span to each stop is a sum
+  // of per-segment journey times - never a product of congestion factors
+  let cursorSeq = anchorSeq;
+  let spanJtMs = 0;
+  let spanTravelMs = 0;
+  const resetSpan = (seq: number) => {
+    cursorSeq = seq;
+    spanJtMs = 0;
+    spanTravelMs = 0;
+  };
+  const spanTo = (seq: number): { jtMs: number; travelMs: number } | null => {
+    for (let s = cursorSeq; s < seq; s++) {
+      const jt = staticSegmentMs(s, s + 1);
+      if (jt == null || !Number.isFinite(jt)) return null;
+      spanJtMs += jt;
+      spanTravelMs += jt * alphaOf(s);
+    }
+    cursorSeq = Math.max(cursorSeq, seq);
+    return { jtMs: spanJtMs, travelMs: spanTravelMs };
+  };
+
   track.cells.set(boardSeq, boardCell);
   result.push(makeObserved(boardSeq, boardCell));
 
   for (let seq = boardSeq + 1; seq <= lastSeq; seq++) {
-    const freeFlowMs = staticSegmentMs(anchorSeq, seq);
-    if (freeFlowMs == null || !Number.isFinite(freeFlowMs)) break;
+    const span = spanTo(seq);
+    if (!span) break;
+    const freeFlowMs = span.jtMs;
 
     const own = track.cells.get(seq);
     if (own && own.etaMs >= publishedEtaMs) {
@@ -447,6 +600,7 @@ export const projectTrack = ({
       anchorSeq = seq;
       anchorEtaMs = own.etaMs;
       publishedEtaMs = own.etaMs;
+      resetSpan(seq);
       continue;
     }
 
@@ -456,11 +610,9 @@ export const projectTrack = ({
       publishedEtaMs,
       anchorEtaMs + freeFlowMs - JOURNEY_FLOOR_SLACK_MS
     );
-    // congestion only adds time, and it is applied once to the whole span
-    // from the last confirmed stop - never compounded hop by hop
     const estimatedMs = Math.max(
       publishedEtaMs,
-      anchorEtaMs + freeFlowMs * congestion
+      anchorEtaMs + span.travelMs
     );
     // an unbounded floor would let the *next* bus at this stop be taken for
     // ours once ours has left, which made the trip run forever; stay within a
@@ -483,6 +635,7 @@ export const projectTrack = ({
       anchorSeq = seq;
       anchorEtaMs = reacquired.etaMs;
       publishedEtaMs = reacquired.etaMs;
+      resetSpan(seq);
       continue;
     }
 
