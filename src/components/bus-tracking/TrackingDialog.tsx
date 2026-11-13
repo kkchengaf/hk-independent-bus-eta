@@ -151,7 +151,7 @@ const TrackingDialog = () => {
             <Chip size="small" color="success" label={t("已到達終點站")} />
           )}
         </Box>
-        {trip.anchorSource === "scheduled" && (
+        {trip.anchorSource === "scheduled" && false &&(
           <Typography variant="caption" sx={scheduledNoticeSx}>
             {t("此班次為預定班次，時間或有偏差")}
           </Typography>

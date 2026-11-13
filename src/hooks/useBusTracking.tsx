@@ -69,6 +69,12 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
   const listsRef = useRef(new Map<number, { points: EtaPoint[]; ts: number }>());
   const listSignaturesRef = useRef(new Map<number, string>());
   const arrivalsRef = useRef(new Map<number, TrackedStop>());
+  /**
+   * Arrivals the bus has actually reached. The operator stops listing a stop
+   * once the bus leaves it, so without this the rebuilt row loses the fact
+   * that our bus was there and re-adopts whichever bus comes next.
+   */
+  const settledRef = useRef(new Map<number, TrackCell>());
   /** stops where our bus has been really seen, for window widening */
   const seenSeqsRef = useRef(new Set<number>());
   const windowStepRef = useRef(0);
@@ -95,6 +101,7 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     listsRef.current = new Map();
     listSignaturesRef.current = new Map();
     arrivalsRef.current = new Map();
+    settledRef.current = new Map();
     seenSeqsRef.current = new Set();
     windowStepRef.current = 0;
     profileRef.current = null;
@@ -172,11 +179,17 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
       staticSegmentMs,
     });
 
-    // 2. Our row is the one holding that pinned cell.
+    // 2. Our row is the one holding that pinned cell. Arrivals the bus has
+    //    already reached are re-attached: the operator drops a stop's ETA once
+    //    the bus leaves it, and losing that would let the next bus be taken
+    //    for ours.
     const track: BusTrack = findTrackByAnchor(table, boardSeq, anchorMs) ?? {
       id: -1,
       cells: new Map([[boardSeq, boardCell]]),
     };
+    settledRef.current.forEach((cell, seq) => {
+      if (seq !== boardSeq) track.cells.set(seq, cell);
+    });
 
     // 3. Walk the row forward. Holes are estimated; a cell of another row is
     //    adopted only when it cannot be a bus running ahead of ours.
@@ -220,6 +233,16 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
           (confirmedLater && stop.etaMs < now - PASS_GRACE_MS);
       } else {
         stop.passed = stop.etaMs < now - PASS_GRACE_MS;
+      }
+      // once the bus has reached a stop, remember it: the operator will drop
+      // that ETA from its list and the next rebuild must not forget it
+      if (stop.passed) {
+        settledRef.current.set(stop.seq, {
+          seq: stop.seq,
+          etaMs: stop.etaMs,
+          etaStr: stop.eta,
+          scheduled: stop.source === "scheduled",
+        });
       }
     }
 

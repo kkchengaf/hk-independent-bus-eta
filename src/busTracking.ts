@@ -63,7 +63,7 @@ export const ESTIMATE_MATCH_TOLERANCE_MS = 3 * 60_000;
 /** an observed arrival leaving this long ago is treated as passed */
 export const PASS_GRACE_MS = 2 * 60_000;
 /** an estimated arrival must be this stale before it is treated as passed */
-export const ESTIMATE_PASS_GRACE_MS = 10 * 60_000;
+export const ESTIMATE_PASS_GRACE_MS = 5 * 60_000;
 
 const MAX_JT_SEGMENTS = 80;
 const JT_CACHE_TTL_MS = 30 * 60_000;
@@ -264,6 +264,14 @@ export const buildTrackTable = ({
 
     let cursorEtaMs = Number.NEGATIVE_INFINITY;
     const claimed = new Set<number>();
+    // the same bus may be late, but not by a whole extra headway; without a
+    // ceiling the next departure is attached to our row the moment our own
+    // bus leaves the stop, which made the trip run forever. Short segments get
+    // at least 6 extra minutes because their congestion ratio is noisier.
+    const maxDeltaMs =
+      journeyMs != null
+        ? journeyMs + Math.max(6 * 60_000, journeyMs)
+        : null;
 
     for (const row of rows) {
       const cell: TrackCell = {
@@ -284,6 +292,7 @@ export const buildTrackTable = ({
           if (nextCell.etaMs < cursorEtaMs) continue;
           const delta = nextCell.etaMs - row.etaMs;
           if (delta < journeyMs - JOURNEY_FLOOR_SLACK_MS) continue;
+          if (maxDeltaMs != null && delta > maxDeltaMs) continue;
           // the least delayed bus that is still physically possible is ours
           if (delta < bestDelta) {
             best = track;
@@ -447,8 +456,24 @@ export const projectTrack = ({
       publishedEtaMs,
       anchorEtaMs + freeFlowMs - JOURNEY_FLOOR_SLACK_MS
     );
+    // congestion only adds time, and it is applied once to the whole span
+    // from the last confirmed stop - never compounded hop by hop
+    const estimatedMs = Math.max(
+      publishedEtaMs,
+      anchorEtaMs + freeFlowMs * congestion
+    );
+    // an unbounded floor would let the *next* bus at this stop be taken for
+    // ours once ours has left, which made the trip run forever; stay within a
+    // delay allowance of our own projection instead
+    const delayAllowanceMs = clamp(
+      freeFlowMs * 0.5,
+      3 * 60_000,
+      10 * 60_000
+    );
+    const ceilingMs = estimatedMs + delayAllowanceMs;
+
     const reacquired = candidatesAt(seq)
-      .filter((cell) => cell.etaMs >= floorMs)
+      .filter((cell) => cell.etaMs >= floorMs && cell.etaMs <= ceilingMs)
       .sort((a, b) => a.etaMs - b.etaMs)[0];
 
     if (reacquired) {
@@ -461,12 +486,6 @@ export const projectTrack = ({
       continue;
     }
 
-    // congestion only adds time, and it is applied once to the whole span
-    // from the last confirmed stop - never compounded hop by hop
-    const estimatedMs = Math.max(
-      publishedEtaMs,
-      anchorEtaMs + freeFlowMs * congestion
-    );
     if (!Number.isFinite(estimatedMs)) break;
     result.push({
       seq,
