@@ -5,14 +5,12 @@ import AppContext from "../context/AppContext";
 import DbContext from "../context/DbContext";
 import useLanguage from "./useTranslation";
 import {
-  DEFAULT_HEADWAY_MS,
   ESTIMATE_PASS_GRACE_MS,
   PASS_GRACE_MS,
   TRACKING_PROGRESS_KEY,
   buildEtaPoints,
   buildTrackTable,
-  estimateProgressSeq,
-  findTrackByCell,
+  findTrackByAnchor,
   journeySegmentMs,
   loadJourneyProfile,
   projectTrack,
@@ -26,8 +24,8 @@ import type {
   TrackingProgress,
 } from "../busTracking";
 
-const BASE_WINDOW = 3;
-const MAX_WINDOW = 8;
+/** polling window sizes; widens while a refresh finds nothing new */
+const WINDOW_STEPS = [3, 5, 8];
 const MAX_CACHED_LISTS = 80;
 const MIN_LIST_TTL_MS = 15_000;
 const BASE_PROFILE_LIMIT = 30;
@@ -36,6 +34,8 @@ const MAX_PROFILE_LIMIT = 90;
 const PROFILE_AHEAD_THRESHOLD = 10;
 /** cached ETA lists older than this are not used to build the table */
 const LISTS_MAX_AGE_MS = 3 * 60_000;
+/** the pinned boarding cell may coincide with an operator row this closely */
+const ANCHOR_MATCH_MS = 60_000;
 
 export interface BusTrackingResult {
   stops: Record<number, TrackedStop>;
@@ -69,12 +69,12 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
   const listsRef = useRef(new Map<number, { points: EtaPoint[]; ts: number }>());
   const listSignaturesRef = useRef(new Map<number, string>());
   const arrivalsRef = useRef(new Map<number, TrackedStop>());
-  const identityRef = useRef<{ seq: number; etaMs: number } | null>(null);
-  const lastSightingsRef = useRef(0);
+  /** stops where our bus has been really seen, for window widening */
+  const seenSeqsRef = useRef(new Set<number>());
+  const windowStepRef = useRef(0);
   const profileRef = useRef<number[] | null>(null);
   const progressWrittenAtRef = useRef(0);
   const progressTerminusRef = useRef<number | null>(null);
-  const windowSizeRef = useRef(BASE_WINDOW);
   const cycleRef = useRef(0);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
@@ -95,12 +95,11 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     listsRef.current = new Map();
     listSignaturesRef.current = new Map();
     arrivalsRef.current = new Map();
-    identityRef.current = null;
-    lastSightingsRef.current = 0;
+    seenSeqsRef.current = new Set();
+    windowStepRef.current = 0;
     profileRef.current = null;
     progressWrittenAtRef.current = 0;
     progressTerminusRef.current = null;
-    windowSizeRef.current = BASE_WINDOW;
     cycleRef.current = 0;
     if (!tripKey) {
       try {
@@ -128,101 +127,87 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     const now = Date.now();
     if (!Number.isFinite(anchorMs) || lastSeq <= boardSeq) return 0;
 
-    const arrivals = new Map<number, TrackedStop>();
     const staticSegmentMs = (fromSeq: number, toSeq: number) =>
       journeySegmentMs(profileRef.current, boardSeq, fromSeq, toSeq);
 
-    // 1. Build the bus/stop table from every fresh list we hold. The boarding
-    //    row is injected so the trip keeps its identity even after the
-    //    operator drops that ETA from the list.
+    // The boarding stop is pinned to the tapped ETA for the whole trip: our
+    // row is defined by it, so no later sighting can turn it into another bus
+    // that has already passed this stop.
+    const boardCell: TrackCell = {
+      seq: boardSeq,
+      etaMs: anchorMs,
+      etaStr: trip.anchorEta,
+      scheduled: trip.anchorSource === "scheduled",
+    };
+
+    // 1. Build the bus/stop table from the lists we hold. The pinned boarding
+    //    cell is injected so our row exists even after the operator drops that
+    //    departure from its list.
     const lists = new Map<number, EtaPoint[]>();
     for (const [seq, cached] of listsRef.current) {
       if (now - cached.ts <= LISTS_MAX_AGE_MS) lists.set(seq, cached.points);
     }
     const boardPoints = lists.get(boardSeq) ?? [];
-    const anchorPoint: EtaPoint = {
-      etaMs: anchorMs,
-      etaStr: trip.anchorEta,
-      scheduled: trip.anchorSource === "scheduled",
-      co: trip.co,
-      dest: trip.dest,
-    };
-    const hasAnchor = boardPoints.some(
-      (point) => Math.abs(point.etaMs - anchorMs) <= 90_000
-    );
-    lists.set(
-      boardSeq,
-      hasAnchor
-        ? boardPoints
-        : [...boardPoints, anchorPoint].sort((a, b) => a.etaMs - b.etaMs)
-    );
+    if (
+      !boardPoints.some(
+        (point) => Math.abs(point.etaMs - anchorMs) <= ANCHOR_MATCH_MS
+      )
+    ) {
+      const anchorPoint: EtaPoint = {
+        etaMs: anchorMs,
+        etaStr: trip.anchorEta,
+        scheduled: trip.anchorSource === "scheduled",
+        co: trip.co,
+        dest: trip.dest,
+      };
+      lists.set(
+        boardSeq,
+        [...boardPoints, anchorPoint].sort((a, b) => a.etaMs - b.etaMs)
+      );
+    }
 
     const table = buildTrackTable({
       seqs: [...lists.keys()],
       lists,
       staticSegmentMs,
-      fallbackHeadwayMs: DEFAULT_HEADWAY_MS,
     });
 
-    // 2. Identify the row of our bus: its last confirmed sighting, otherwise
-    //    the ETA the user tapped.
-    const identity = identityRef.current;
-    const track: BusTrack =
-      (identity && findTrackByCell(table, identity.seq, identity.etaMs)) ||
-      findTrackByCell(table, boardSeq, anchorMs) || {
-        id: -1,
-        cells: new Map([
-          [
-            boardSeq,
-            {
-              seq: boardSeq,
-              etaMs: anchorMs,
-              etaStr: trip.anchorEta,
-              scheduled: trip.anchorSource === "scheduled",
-            },
-          ],
-        ]),
-      };
+    // 2. Our row is the one holding that pinned cell.
+    const track: BusTrack = findTrackByAnchor(table, boardSeq, anchorMs) ?? {
+      id: -1,
+      cells: new Map([[boardSeq, boardCell]]),
+    };
 
-    // 3. Project the row into per-stop arrivals. Stops where our bus is not
-    //    listed are interpolated between its own sightings, and a bus that
-    //    appears exactly where ours is due is adopted so the ride continues
-    //    after a congested black spot.
-    const { stops: projected, adopted } = projectTrack({
+    // 3. Walk the row forward. Holes are estimated; a cell of another row is
+    //    adopted only when it cannot be a bus running ahead of ours.
+    const { stops: projected } = projectTrack({
       track,
       boardSeq,
       lastSeq,
+      boardCell,
       staticSegmentMs,
-      factors: table.factors,
-      medianFactor: table.medianFactor,
+      alpha: table.alpha,
       now,
-      otherCells: (seq) =>
+      candidatesAt: (seq) =>
         table.tracks
-          .filter((candidate) => candidate.id !== track.id)
+          .filter((candidate) => candidate !== track)
           .map((candidate) => candidate.cells.get(seq))
           .filter((cell): cell is TrackCell => !!cell),
     });
+    const arrivals = new Map<number, TrackedStop>();
     for (const stop of projected) arrivals.set(stop.seq, stop);
 
-    // 4. Remember the newest real sighting so the row survives the next
-    //    rebuild, and grow the polling window while the bus stays hidden.
-    const realCells = [...track.cells.values()].filter(
-      (cell) => cell.seq >= boardSeq && !adopted.includes(cell.seq)
-    );
-    const newest = realCells.reduce<TrackCell | null>(
-      (acc, cell) => (!acc || cell.seq > acc.seq ? cell : acc),
-      null
-    );
-    if (newest) {
-      identityRef.current = { seq: newest.seq, etaMs: newest.etaMs };
+    // 4. Count stops where the bus was really seen, so the polling window can
+    //    widen when a refresh found nothing new.
+    const observedSeqs = projected
+      .filter((stop) => stop.source !== "estimate")
+      .map((stop) => stop.seq);
+    let added = 0;
+    for (const seq of observedSeqs) {
+      if (seenSeqsRef.current.has(seq)) continue;
+      seenSeqsRef.current.add(seq);
+      added += 1;
     }
-    const added = Math.max(0, realCells.length - lastSightingsRef.current);
-    lastSightingsRef.current = Math.max(
-      lastSightingsRef.current,
-      realCells.length
-    );
-
-    const observedSeqs = realCells.map((cell) => cell.seq);
     for (const stop of arrivals.values()) {
       if (stop.source === "estimate") {
         // projections are built from real sightings, so an overdue one has
@@ -371,47 +356,40 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
     busyRef.current = true;
     setIsRefreshing(true);
     try {
-      const anchorMs = Date.parse(trip.anchorEta);
-      let lastObservedSeq = trip.boardSeq;
-      let lastObservedPassed = false;
+      // the window is anchored at the last stop where the bus was really
+      // seen; congestion makes a bus slower than any projection, so looking
+      // near its last sighting is what finds it again
+      let lastSightingSeq = trip.boardSeq;
+      let lastSightingPassed = false;
       for (const [seq, stop] of arrivalsRef.current) {
-        if (stop.source === "estimate" || seq < lastObservedSeq) continue;
-        lastObservedSeq = seq;
-        lastObservedPassed = stop.passed;
-      }
-
-      const progressSeq = estimateProgressSeq(
-        profileRef.current,
-        trip.boardSeq,
-        Date.now() - anchorMs
-      );
-
-      // extend the journey-time horizon as the bus approaches its end
-      if (
-        profileLimit < MAX_PROFILE_LIMIT &&
-        progressSeq + PROFILE_AHEAD_THRESHOLD >= trip.boardSeq + profileLimit
-      ) {
-        setProfileLimit((limit) =>
-          Math.min(limit + PROFILE_STEP, MAX_PROFILE_LIMIT)
-        );
+        if (stop.source === "estimate") continue;
+        if (seq >= lastSightingSeq) {
+          lastSightingSeq = seq;
+          lastSightingPassed = stop.passed;
+        }
       }
 
       const windowStart = Math.min(
         lastSeq,
         Math.max(
           trip.boardSeq,
-          Math.max(
-            lastObservedPassed ? lastObservedSeq + 1 : lastObservedSeq,
-            // never look ahead of the bus: a delayed vehicle would otherwise
-            // fall behind the polling window and stay untracked
-            Math.min(progressSeq - 1, lastObservedSeq + 1)
-          )
+          lastSightingPassed ? lastSightingSeq + 1 : lastSightingSeq
         )
       );
       const windowEnd = Math.min(
         lastSeq,
-        windowStart + windowSizeRef.current - 1
+        windowStart + WINDOW_STEPS[windowStepRef.current] - 1
       );
+
+      // extend the journey-time horizon as the window reaches its end
+      if (
+        profileLimit < MAX_PROFILE_LIMIT &&
+        windowEnd + PROFILE_AHEAD_THRESHOLD >= trip.boardSeq + profileLimit
+      ) {
+        setProfileLimit((limit) =>
+          Math.min(limit + PROFILE_STEP, MAX_PROFILE_LIMIT)
+        );
+      }
 
       const seqs = new Set<number>();
       for (let seq = windowStart; seq <= windowEnd; seq++) seqs.add(seq);
@@ -459,10 +437,11 @@ export const useBusTracking = (trip: TrackedTrip | null): BusTrackingResult => {
       }
 
       const added = recompute();
-      windowSizeRef.current =
-        added === 0
-          ? Math.min(windowSizeRef.current + 2, MAX_WINDOW)
-          : BASE_WINDOW;
+      // widen the search while a refresh finds nothing new, then snap back
+      windowStepRef.current =
+        added > 0
+          ? 0
+          : Math.min(windowStepRef.current + 1, WINDOW_STEPS.length - 1);
       cycleRef.current += 1;
     } catch (e) {
       if (mountedRef.current) console.error(e);

@@ -150,20 +150,6 @@ export const buildEtaPoints = (
   return chosen.sort((a, b) => a.etaMs - b.etaMs);
 };
 
-export const DEFAULT_HEADWAY_MS = 6 * 60_000;
-
-/** typical spacing between consecutive buses at a stop */
-export const headwayOf = (
-  points: EtaPoint[],
-  fallbackMs = DEFAULT_HEADWAY_MS
-): number => {
-  const gaps: number[] = [];
-  for (let i = 1; i < points.length; i++) {
-    gaps.push(points[i].etaMs - points[i - 1].etaMs);
-  }
-  return gaps.length ? median(gaps) : fallbackMs;
-};
-
 /** cumulative journey-time profile (minutes) from `startSeq`, indexed by offset */
 export const journeySegmentMs = (
   profile: number[] | null,
@@ -174,23 +160,9 @@ export const journeySegmentMs = (
   if (!profile || toSeq <= fromSeq) return null;
   const from = profile[fromSeq - startSeq];
   const to = profile[toSeq - startSeq];
-  if (from == null || to == null) return null;
+  // a NaN can leak in from a failed segment fetch; treat it as unknown
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return null;
   return Math.max(0, (to - from) * 60_000);
-};
-
-/** best guess of the stop the bus is at, based on elapsed time and the profile */
-export const estimateProgressSeq = (
-  profile: number[] | null,
-  startSeq: number,
-  elapsedMs: number
-): number => {
-  if (!profile || profile.length === 0) return startSeq;
-  const elapsedMinutes = elapsedMs / 60_000;
-  let seq = startSeq;
-  for (let i = 0; i < profile.length; i++) {
-    if (profile[i] <= elapsedMinutes) seq = startSeq + i;
-  }
-  return seq;
 };
 
 export const canTrackRoute = (
@@ -240,10 +212,8 @@ export interface BusTrack {
 
 export interface TrackTable {
   tracks: BusTrack[];
-  /** observed travel time / static journey time, per segment start */
-  factors: Map<number, number>;
-  /** median observed segment time across the table */
-  medianFactor: number;
+  /** observed travel time / journey time, applied once to any estimate */
+  alpha: number;
 }
 
 export interface BuildTrackTableOptions {
@@ -252,29 +222,35 @@ export interface BuildTrackTableOptions {
   lists: Map<number, EtaPoint[]>;
   /** static journey time between two stops, from the journey profile */
   staticSegmentMs: (fromSeq: number, toSeq: number) => number | null;
-  fallbackHeadwayMs?: number;
 }
 
-/** observations never associate further apart than this */
-const TRACK_ASSOCIATION_CAP_MS = 45 * 60_000;
-/** ETA rounding can make the next stop look slightly earlier */
-const TRACK_EARLY_SLACK_MS = 60_000;
-/** segments this long are checked against a minimum plausible speed */
-const TRACK_LONG_SEGMENT_MS = 5 * 60_000;
+/**
+ * A bus cannot beat free flow, but both the ETA and the journey time are
+ * minute-quantised and the model is a statistical estimate, so anything within
+ * this window of the journey time is still the same bus.
+ */
+const JOURNEY_FLOOR_SLACK_MS = 2 * 60_000;
 
 /**
- * Build the bus/stop table. Buses are laid out along the columns from the
- * furthest known stop backwards, preserving order: a bus can never overtake
- * another, so each row can only claim a later column than the row before it.
+ * Build the bus/stop table.
+ *
+ * Buses are laid out along the columns from the furthest known stop backwards,
+ * preserving order: a bus can never overtake another, so each row can only
+ * claim a later column than the row before it.
+ *
+ * A row is only extended when the implied travel time is at least the journey
+ * time of that segment. Congestion can only make a bus slower than free flow,
+ * never faster, so a candidate quicker than `staticSegmentMs` belongs to a
+ * different bus - this is what stops a leading bus from stealing our row.
+ * When the journey time of a segment is unknown, that segment is left alone:
+ * nothing is associated there and the bus is estimated instead.
  */
 export const buildTrackTable = ({
   seqs,
   lists,
   staticSegmentMs,
-  fallbackHeadwayMs = DEFAULT_HEADWAY_MS,
 }: BuildTrackTableOptions): TrackTable => {
   const tracks: BusTrack[] = [];
-  const factors = new Map<number, number>();
   const sortedSeqs = [...seqs].sort((a, b) => a - b);
 
   let nextId = 1;
@@ -284,52 +260,37 @@ export const buildTrackTable = ({
     if (rows.length === 0) continue;
 
     const nextSeq = i + 1 < sortedSeqs.length ? sortedSeqs[i + 1] : null;
-    const expected =
-      nextSeq != null ? staticSegmentMs(seq, nextSeq) : null;
-    const headway = headwayOf(rows, fallbackHeadwayMs);
-    // a bus cannot cover a long segment in a fraction of its journey time,
-    // and cannot take much longer than the worst congestion we accept
-    const minDeltaMs =
-      expected != null && expected >= TRACK_LONG_SEGMENT_MS
-        ? expected * 0.4
-        : 0;
-    const maxDeltaMs =
-      expected != null
-        ? Math.min(
-            Math.max(3 * 60_000, expected * 1.8),
-            TRACK_ASSOCIATION_CAP_MS
-          )
-        : Math.max(10 * 60_000, headway * 2);
+    const journeyMs = nextSeq != null ? staticSegmentMs(seq, nextSeq) : null;
 
     let cursorEtaMs = Number.NEGATIVE_INFINITY;
     const claimed = new Set<number>();
 
     for (const row of rows) {
-      let best: BusTrack | null = null;
-      let bestDiff = Number.POSITIVE_INFINITY;
-
-      for (const track of tracks) {
-        if (claimed.has(track.id)) continue;
-        if (nextSeq == null) continue;
-        const cell = track.cells.get(nextSeq);
-        if (!cell) continue;
-        if (cell.etaMs < cursorEtaMs) continue;
-        const delta = cell.etaMs - row.etaMs;
-        if (delta < minDeltaMs - TRACK_EARLY_SLACK_MS) continue;
-        if (delta > maxDeltaMs) continue;
-        const diff = Math.abs(delta - (expected ?? delta));
-        if (diff < bestDiff) {
-          best = track;
-          bestDiff = diff;
-        }
-      }
-
       const cell: TrackCell = {
         seq,
         etaMs: row.etaMs,
         etaStr: row.etaStr,
         scheduled: row.scheduled,
       };
+
+      let best: BusTrack | null = null;
+      let bestDelta = Number.POSITIVE_INFINITY;
+
+      if (nextSeq != null && journeyMs != null) {
+        for (const track of tracks) {
+          if (claimed.has(track.id)) continue;
+          const nextCell = track.cells.get(nextSeq);
+          if (!nextCell) continue;
+          if (nextCell.etaMs < cursorEtaMs) continue;
+          const delta = nextCell.etaMs - row.etaMs;
+          if (delta < journeyMs - JOURNEY_FLOOR_SLACK_MS) continue;
+          // the least delayed bus that is still physically possible is ours
+          if (delta < bestDelta) {
+            best = track;
+            bestDelta = delta;
+          }
+        }
+      }
 
       if (best && nextSeq != null) {
         best.cells.set(seq, cell);
@@ -341,54 +302,48 @@ export const buildTrackTable = ({
     }
   }
 
-  // observed speed per segment; this is the "alpha" over the journey-time model
-  const samples = new Map<number, number[]>();
-  for (const track of tracks) {
-    const stops = [...track.cells.keys()].sort((a, b) => a - b);
-    for (const seq of stops) {
-      const cell = track.cells.get(seq)!;
-      const nextCell = track.cells.get(seq + 1);
-      if (!nextCell) continue;
-      const expected = staticSegmentMs(seq, seq + 1);
-      if (expected == null || expected <= 0) continue;
-      const observed = nextCell.etaMs - cell.etaMs;
-      if (observed <= 0) continue;
-      const list = samples.get(seq) ?? [];
-      list.push(observed / expected);
-      samples.set(seq, list);
-    }
-  }
-
+  // observed speed across the whole table; this is the single "alpha" applied
+  // to the journey time when a stop has to be estimated. It is capped at 2x
+  // because the association floor already allows arbitrarily late buses, and
+  // an inflated alpha would stretch every remaining hop.
   const allSamples: number[] = [];
-  for (const [seq, values] of samples) {
-    const factor = clamp(median(values), 1, 3);
-    factors.set(seq, factor);
-    allSamples.push(...values);
+  for (const track of tracks) {
+    const known = [...track.cells.keys()].sort((a, b) => a - b);
+    for (let i = 1; i < known.length; i++) {
+      const from = known[i - 1];
+      const to = known[i];
+      const expected = staticSegmentMs(from, to);
+      if (expected == null || expected <= 0) continue;
+      const observed = track.cells.get(to)!.etaMs - track.cells.get(from)!.etaMs;
+      if (!Number.isFinite(observed) || observed <= 0) continue;
+      allSamples.push(observed / expected);
+    }
   }
 
   return {
     tracks,
-    factors,
-    medianFactor: allSamples.length
-      ? clamp(median(allSamples), 1, 3)
-      : 1,
+    alpha: allSamples.length ? clamp(median(allSamples), 1, 2) : 1,
   };
 };
 
-/** the track that owns the ETA row at `seq` (our bus, at the start) */
-export const findTrackByCell = (
+/**
+ * Our bus is identified by the ETA the user tapped. That cell is pinned at the
+ * boarding stop on every rebuild, so the row holding it is always our row -
+ * never a row that merely happens to be near a later sighting.
+ */
+export const findTrackByAnchor = (
   table: TrackTable,
-  seq: number,
-  etaMs: number,
-  toleranceMs = 90_000
+  boardSeq: number,
+  anchorMs: number,
+  toleranceMs = 60_000
 ): BusTrack | null => {
   let best: BusTrack | null = null;
   let bestDiff = toleranceMs;
   for (const track of table.tracks) {
-    const cell = track.cells.get(seq);
+    const cell = track.cells.get(boardSeq);
     if (!cell) continue;
-    const diff = Math.abs(cell.etaMs - etaMs);
-    if (diff <= bestDiff) {
+    const diff = Math.abs(cell.etaMs - anchorMs);
+    if (diff < bestDiff || (diff === bestDiff && best && track.cells.size > best.cells.size)) {
       best = track;
       bestDiff = diff;
     }
@@ -400,147 +355,128 @@ export interface ProjectTrackOptions {
   track: BusTrack;
   boardSeq: number;
   lastSeq: number;
+  /** the pinned ETA of the tracked bus at the boarding stop */
+  boardCell: TrackCell;
   staticSegmentMs: (fromSeq: number, toSeq: number) => number | null;
-  factors: Map<number, number>;
-  medianFactor: number;
+  /** travel time / journey time observed across the fleet, >= 1 */
+  alpha: number;
   now: number;
-  /** cells of every other bus at a stop, used to re-acquire a hidden bus */
-  otherCells?: (seq: number) => TrackCell[];
+  /** cells of every other bus at a stop, used to re-acquire our bus */
+  candidatesAt: (seq: number) => TrackCell[];
 }
 
 export interface ProjectTrackResult {
   stops: TrackedStop[];
-  /** stops where another bus was adopted as ours */
+  /** stops where a cell of another row was confirmed as ours */
   adopted: number[];
 }
 
 /**
- * Turn a row of the table into the per-stop series we display. Holes are
- * interpolated between the row's own sightings, and extrapolated with the
- * journey time scaled by the congestion factor observed on that segment.
- * When another bus appears exactly where ours is due, it is adopted so the
- * ride continues after a congested black spot.
+ * Turn a row of the table into the per-stop series we display.
+ *
+ * The row is walked forward from the pinned boarding cell. A stop with a cell
+ * of our own is published as observed. A hole is filled with another row's
+ * cell only when that cell is at least one free-flow journey time after the
+ * last confirmed position, so it can never be a bus running ahead of ours.
+ * Everything else is estimated with the journey time scaled once by the
+ * congestion ratio: applying a per-segment factor cumulatively would inflate
+ * every hop and drift away from reality within a few stops.
  */
 export const projectTrack = ({
   track,
   boardSeq,
   lastSeq,
+  boardCell,
   staticSegmentMs,
-  factors,
-  medianFactor,
+  alpha,
   now,
-  otherCells,
+  candidatesAt,
 }: ProjectTrackOptions): ProjectTrackResult => {
-  const cells = track.cells;
-  const knownSeqs = [...cells.keys()].sort((a, b) => a - b);
   const adopted: number[] = [];
-  if (knownSeqs.length === 0) return { stops: [], adopted };
-
-  const factorOf = (fromSeq: number, toSeq: number): number => {
-    let factor = 1;
-    for (let s = fromSeq; s < toSeq; s++) {
-      factor *= factors.get(s) ?? medianFactor;
-    }
-    return factor;
-  };
-
-  const expectedMs = (fromSeq: number, toSeq: number): number | null => {
-    const base = staticSegmentMs(fromSeq, toSeq);
-    if (base == null) return null;
-    return base * factorOf(fromSeq, toSeq);
-  };
-
   const result: TrackedStop[] = [];
-  let prevEtaMs = Number.NEGATIVE_INFINITY;
 
-  for (let seq = boardSeq; seq <= lastSeq; seq++) {
-    const cell = cells.get(seq);
-    if (cell) {
-      result.push({
-        seq,
-        eta: cell.etaStr,
-        etaMs: cell.etaMs,
-        source: cell.scheduled ? "scheduled" : "realtime",
-        passed: false,
-        updatedAt: now,
-      });
-      prevEtaMs = Math.max(prevEtaMs, cell.etaMs);
+  // prefer the speed our own row has shown so far, else the fleet's
+  const ownRatios: number[] = [];
+  const ownSeqs = [...track.cells.keys()].sort((a, b) => a - b);
+  for (let i = 1; i < ownSeqs.length; i++) {
+    const from = ownSeqs[i - 1];
+    const to = ownSeqs[i];
+    const expected = staticSegmentMs(from, to);
+    if (expected == null || expected <= 0) continue;
+    const observed =
+      track.cells.get(to)!.etaMs - track.cells.get(from)!.etaMs;
+    if (!Number.isFinite(observed) || observed <= 0) continue;
+    ownRatios.push(observed / expected);
+  }
+  const congestion = clamp(ownRatios.length ? median(ownRatios) : alpha, 1, 2);
+
+  const makeObserved = (seq: number, cell: TrackCell): TrackedStop => ({
+    seq,
+    eta: cell.etaStr,
+    etaMs: cell.etaMs,
+    source: cell.scheduled ? "scheduled" : "realtime",
+    passed: false,
+    updatedAt: now,
+  });
+
+  // last stop with real evidence, and the last value we published
+  let anchorSeq = boardSeq;
+  let anchorEtaMs = boardCell.etaMs;
+  let publishedEtaMs = boardCell.etaMs;
+  if (!Number.isFinite(publishedEtaMs)) return { stops: [], adopted };
+
+  track.cells.set(boardSeq, boardCell);
+  result.push(makeObserved(boardSeq, boardCell));
+
+  for (let seq = boardSeq + 1; seq <= lastSeq; seq++) {
+    const freeFlowMs = staticSegmentMs(anchorSeq, seq);
+    if (freeFlowMs == null || !Number.isFinite(freeFlowMs)) break;
+
+    const own = track.cells.get(seq);
+    if (own && own.etaMs >= publishedEtaMs) {
+      result.push(makeObserved(seq, own));
+      anchorSeq = seq;
+      anchorEtaMs = own.etaMs;
+      publishedEtaMs = own.etaMs;
       continue;
     }
 
-    const before = [...knownSeqs].reverse().find((s) => s < seq);
-    const after = knownSeqs.find((s) => s > seq);
-    const stepMs =
-      before != null ? expectedMs(before, seq) : null;
-    let etaMs: number | null = null;
+    // a bus cannot beat free flow by more than the rounding slack, and it
+    // cannot arrive before the stop we have already published
+    const floorMs = Math.max(
+      publishedEtaMs,
+      anchorEtaMs + freeFlowMs - JOURNEY_FLOOR_SLACK_MS
+    );
+    const reacquired = candidatesAt(seq)
+      .filter((cell) => cell.etaMs >= floorMs)
+      .sort((a, b) => a.etaMs - b.etaMs)[0];
 
-    if (before != null && after != null) {
-      // interpolate between two sightings of the same bus
-      const span = expectedMs(before, after);
-      const part = expectedMs(before, seq);
-      if (span != null && part != null && span > 0) {
-        const beforeEta = cells.get(before)!.etaMs;
-        const afterEta = cells.get(after)!.etaMs;
-        etaMs = beforeEta + ((afterEta - beforeEta) * part) / span;
-      }
-    } else if (before != null && stepMs != null) {
-      etaMs = cells.get(before)!.etaMs + stepMs;
-    } else if (before == null && after != null) {
-      const step = expectedMs(seq, after);
-      if (step != null) etaMs = cells.get(after)!.etaMs - step;
+    if (reacquired) {
+      track.cells.set(seq, reacquired);
+      adopted.push(seq);
+      result.push(makeObserved(seq, reacquired));
+      anchorSeq = seq;
+      anchorEtaMs = reacquired.etaMs;
+      publishedEtaMs = reacquired.etaMs;
+      continue;
     }
 
-    // re-acquire the bus when another row lands where ours is due
-    if (otherCells) {
-      const reference =
-        etaMs ??
-        (before != null ? cells.get(before)!.etaMs + (stepMs ?? 0) : null);
-      if (reference != null) {
-        const tolerance = Math.max(
-          2 * 60_000,
-          (stepMs ?? 0) * 0.35
-        );
-        const lowerBound = Number.isFinite(prevEtaMs)
-          ? prevEtaMs
-          : Number.NEGATIVE_INFINITY;
-        const candidates = otherCells(seq)
-          .filter((candidate) => candidate.etaMs >= lowerBound)
-          .sort(
-            (a, b) =>
-              Math.abs(a.etaMs - reference) - Math.abs(b.etaMs - reference)
-          );
-        const candidate = candidates[0];
-        if (
-          candidate &&
-          Math.abs(candidate.etaMs - reference) <= tolerance
-        ) {
-          cells.set(seq, candidate);
-          adopted.push(seq);
-          result.push({
-            seq,
-            eta: candidate.etaStr,
-            etaMs: candidate.etaMs,
-            source: candidate.scheduled ? "scheduled" : "realtime",
-            passed: false,
-            updatedAt: now,
-          });
-          prevEtaMs = Math.max(prevEtaMs, candidate.etaMs);
-          continue;
-        }
-      }
-    }
-
-    if (etaMs == null) break;
-    if (Number.isFinite(prevEtaMs)) etaMs = Math.max(etaMs, prevEtaMs);
+    // congestion only adds time, and it is applied once to the whole span
+    // from the last confirmed stop - never compounded hop by hop
+    const estimatedMs = Math.max(
+      publishedEtaMs,
+      anchorEtaMs + freeFlowMs * congestion
+    );
+    if (!Number.isFinite(estimatedMs)) break;
     result.push({
       seq,
-      eta: new Date(etaMs).toISOString(),
-      etaMs,
+      eta: new Date(estimatedMs).toISOString(),
+      etaMs: estimatedMs,
       source: "estimate",
       passed: false,
       updatedAt: now,
     });
-    prevEtaMs = etaMs;
+    publishedEtaMs = estimatedMs;
   }
 
   return { stops: result, adopted };
@@ -614,7 +550,11 @@ export const loadJourneyProfile = async ({
     if (signal?.aborted) throw new Error("journey profile aborted");
 
     for (const value of minutes) {
-      running += value;
+      // a failed segment fetch can resolve to NaN/Infinity; a single bad hop
+      // must not poison the whole cumulative profile
+      running += Number.isFinite(value) && value > 0
+        ? value
+        : FALLBACK_SEGMENT_MINUTES;
       profile.push(running);
     }
     seq += batch.length;
